@@ -1,8 +1,3 @@
-
-Karma Test16 <testkarma703@gmail.com>
-12:32 AM (1 minute ago)
-to me
-
 require("dotenv").config();
 
 const {
