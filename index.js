@@ -16,6 +16,9 @@ const {
 const OpenAI = require("openai");
 const { createClient } = require("@supabase/supabase-js");
 
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
