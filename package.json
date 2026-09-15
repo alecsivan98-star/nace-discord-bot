@@ -1,12 +1,13 @@
 {
   "name": "nace-discord-bot",
   "version": "1.0.0",
-  "description": "NACE Discord onboarding and registration verification bot",
+  "description": "NACE Discord onboarding, verification, signals and team management bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.57.4",
     "discord.js": "^14.22.1",
     "dotenv": "^17.2.2",
     "openai": "^6.0.0"
