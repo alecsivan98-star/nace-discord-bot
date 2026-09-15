@@ -7,9 +7,14 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  PermissionsBitField,
+  SlashCommandBuilder,
+  REST,
+  Routes,
 } = require("discord.js");
 
 const OpenAI = require("openai");
+const { createClient } = require("@supabase/supabase-js");
 
 const client = new Client({
   intents: [
@@ -25,14 +30,164 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_KEY
+);
+
 const GUILD_ID = process.env.GUILD_ID;
 const TRADER_ROLE_ID = process.env.TRADER_ROLE_ID;
 const NACE_URL = process.env.NACE_URL || "https://nacetuin.com/";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.6-luna";
 
-/* =========================================================
+const SIGNAL_TIMES = {
+  normal1: { hour: 12, minute: 10 },
+  newMember: { hour: 13, minute: 0 },
+  teamLeader: { hour: 12, minute: 30 },
+  normal2: { hour: 17, minute: 10 },
+  normal3: { hour: 20, minute: 10 },
+};
+
+const NORMAL_SIGNAL_ROLES = [
+  "Trader",
+  "Team Leader",
+  "Moderator",
+  "Admin",
+];
+
+let signalChannelId = process.env.SIGNAL_CHANNEL_ID || null;
+
+/* =========================
+   SUPABASE
+========================= */
+
+async function saveMember(member) {
+  const { error } = await supabase
+    .from("members")
+    .upsert(
+      {
+        discord_id: member.id,
+        username: member.user.tag,
+        joined_at: member.joinedAt || new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      },
+      {
+        onConflict: "discord_id",
+      }
+    );
+
+  if (error) {
+    console.error("Supabase saveMember:", error.message);
+  }
+}
+
+async function getMemberData(discordId) {
+  const { data, error } = await supabase
+    .from("members")
+    .select("*")
+    .eq("discord_id", discordId)
+    .maybeSingle();
+
+  if (error) {
+    console.error("Supabase getMemberData:", error.message);
+    return null;
+  }
+
+  return data;
+}
+
+async function activateNewMemberBonus(member) {
+  const existing = await getMemberData(member.id);
+
+  if (existing?.new_member_bonus_start) {
+    return;
+  }
+
+  const start = new Date();
+  const end = new Date(start.getTime() + 3 * 24 * 60 * 60 * 1000);
+
+  const { error } = await supabase
+    .from("members")
+    .upsert(
+      {
+        discord_id: member.id,
+        username: member.user.tag,
+        joined_at: member.joinedAt || start.toISOString(),
+        new_member_bonus_start: start.toISOString(),
+        new_member_bonus_end: end.toISOString(),
+        updated_at: new Date().toISOString(),
+      },
+      {
+        onConflict: "discord_id",
+      }
+    );
+
+  if (error) {
+    console.error("Supabase activateNewMemberBonus:", error.message);
+  }
+}
+
+async function createTeamInDatabase(
+  leaderId,
+  memberIds
+) {
+  if (memberIds.length !== 5) {
+    throw new Error("Echipa trebuie să aibă exact 5 membri.");
+  }
+
+  const formedAt = new Date();
+  const bonusEnd = new Date(
+    formedAt.getTime() + 20 * 24 * 60 * 60 * 1000
+  );
+
+  const { data, error } = await supabase
+    .from("teams")
+    .insert({
+      leader_discord_id: leaderId,
+      member_1: memberIds[0],
+      member_2: memberIds[1],
+      member_3: memberIds[2],
+      member_4: memberIds[3],
+      member_5: memberIds[4],
+      formed_at: formedAt.toISOString(),
+      bonus_start: formedAt.toISOString(),
+      bonus_end: bonusEnd.toISOString(),
+    })
+    .select()
+    .single();
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  const teamId = data.id;
+
+  const { error: leaderError } = await supabase
+    .from("members")
+    .upsert(
+      {
+        discord_id: leaderId,
+        is_team_leader: true,
+        team_id: teamId,
+        team_bonus_start: formedAt.toISOString(),
+        team_bonus_end: bonusEnd.toISOString(),
+        updated_at: new Date().toISOString(),
+      },
+      {
+        onConflict: "discord_id",
+      }
+    );
+
+  if (leaderError) {
+    console.error("Supabase leader update:", leaderError.message);
+  }
+
+  return data;
+}
+
+/* =========================
    VERIFICARE SCREENSHOT
-========================================================= */
+========================= */
 
 async function verifyScreenshot(imageUrl) {
   const response = await openai.responses.create({
@@ -51,11 +206,10 @@ The screenshot can be APPROVED only if ALL of these requirements are satisfied:
 1. A visible "Verified" status is present.
 2. A visible account section is present:
    - "Found Account"
-   OR
-   - "Trading Account"
+   - OR "Trading Account"
 3. A numerical account/trading amount is visible.
 4. The amount must be at least 500.
-5. The screenshot must provide reasonably clear visual evidence.
+5. The screenshot must be reasonably clear.
 
 Do not guess missing information.
 
@@ -84,8 +238,6 @@ If rejected:
   "amount": 0,
   "reason": "Explain briefly which required condition is missing."
 }
-
-The amount field must contain the numeric amount actually visible.
 `,
           },
           {
@@ -129,10 +281,6 @@ The amount field must contain the numeric amount actually visible.
   };
 }
 
-/* =========================================================
-   ROL TRADER
-========================================================= */
-
 async function giveTraderRole(member) {
   const role = await member.guild.roles.fetch(TRADER_ROLE_ID);
 
@@ -151,9 +299,9 @@ async function giveTraderRole(member) {
   }
 }
 
-/* =========================================================
-   MENIU PRINCIPAL
-========================================================= */
+/* =========================
+   MENIURI
+========================= */
 
 function mainMenu() {
   const row1 = new ActionRowBuilder().addComponents(
@@ -181,59 +329,35 @@ function mainMenu() {
   );
 
   return {
-    content:
-      `🤖 **NACE Assistant**\n\n` +
-      `Te ghidez pas cu pas prin procesul NACE.\n\n` +
-      `Alege ce vrei să faci:`,
+    content: "👇 **Alege ce vrei să faci:**",
     components: [row1, row2],
   };
 }
-
-/* =========================================================
-   TUTORIAL ÎNREGISTRARE NACE
-========================================================= */
 
 function registrationTutorial() {
   return {
     content:
       `🚀 **TUTORIAL COMPLET — ÎNREGISTRARE NACE**\n\n` +
-
-      `**1️⃣ Intră pe NACE**\n` +
-      `${NACE_URL}\n\n` +
-
+      `**1️⃣ Intră pe NACE**\n${NACE_URL}\n\n` +
       `**2️⃣ Creează contul**\n` +
-      `Apasă pe opțiunea de înregistrare și completează datele solicitate de NACE.\n\n` +
-
+      `Apasă pe opțiunea de înregistrare și completează datele solicitate.\n\n` +
       `**3️⃣ Confirmă contul**\n` +
-      `Urmează pașii de confirmare afișați de platformă.\n\n` +
-
+      `Urmează pașii afișați de platformă.\n\n` +
       `**4️⃣ Intră în cont**\n` +
       `După înregistrare, conectează-te în contul NACE.\n\n` +
-
       `**5️⃣ Verificarea identității**\n` +
-      `Dacă platforma îți solicită verificarea identității/KYC, urmează pașii afișați direct în NACE.\n\n` +
-
-      `🔐 **Important:** nu trimite nimănui parola, codurile 2FA, seed phrase sau cheia privată.\n\n` +
-
+      `Dacă platforma solicită KYC, urmează pașii afișați direct în NACE.\n\n` +
+      `🔐 Nu trimite parola, codurile 2FA, seed phrase sau cheia privată.\n\n` +
       `**6️⃣ Intră în zona de trading**\n` +
-      `După ce ai terminat înregistrarea și verificările solicitate, intră în contul tău și verifică zona de trading.\n\n` +
-
+      `Verifică zona de trading disponibilă în cont.\n\n` +
       `**7️⃣ Alimentează contul**\n` +
-      `Dacă vrei să depui crypto, apasă pe butonul **💰 Alimentare cont** și alege tutorialul pentru OKX, Binance sau Bitget.\n\n` +
-
+      `Apasă pe **💰 Alimentare cont** pentru tutorialele OKX, Binance și Bitget.\n\n` +
       `**8️⃣ Verifică depunerea**\n` +
-      `După transfer, verifică dacă fondurile au ajuns și dacă informațiile contului sunt afișate corect.\n\n` +
-
+      `Confirmă că fondurile au ajuns în cont.\n\n` +
       `**9️⃣ Ultimul pas**\n` +
-      `După ce ai finalizat procesul, trimite screenshot-ul aici în DM pentru verificarea automată.\n\n` +
-
-      `📸 **Nu trimite screenshot-ul înainte să fie vizibile informațiile necesare pentru verificare.**`,
+      `Trimite screenshot-ul aici în DM pentru verificare.`
   };
 }
-
-/* =========================================================
-   MENIU ALIMENTARE
-========================================================= */
 
 function fundingMenu() {
   const row = new ActionRowBuilder().addComponents(
@@ -256,358 +380,450 @@ function fundingMenu() {
   return {
     content:
       `💰 **ALIMENTARE CONT NACE**\n\n` +
-      `Alege platforma de pe care vrei să trimiți crypto către NACE:\n\n` +
-      `🟢 OKX\n` +
-      `🟡 Binance\n` +
-      `🔵 Bitget\n\n` +
-      `⚠️ Înainte de orice transfer verifică întotdeauna moneda, adresa și rețeaua afișate în contul NACE.`,
+      `Alege platforma de pe care vrei să trimiți crypto către NACE.\n\n` +
+      `⚠️ Verifică întotdeauna moneda, adresa și rețeaua afișate în NACE.`,
     components: [row],
   };
 }
-
-/* =========================================================
-   OKX
-========================================================= */
 
 function okxTutorial() {
   return {
     content:
       `🟢 **TUTORIAL OKX → NACE**\n\n` +
-
-      `**1️⃣ Creează cont OKX**\n` +
-      `Înregistrează-te pe OKX și urmează pașii solicitați pentru verificarea contului.\n\n` +
-
-      `**2️⃣ Cumpără crypto**\n` +
-      `Cumpără moneda pe care intenționezi să o trimiți către NACE, dacă este disponibilă pentru metoda ta de plată.\n\n` +
-
-      `**3️⃣ Intră în Assets**\n` +
-      `Deschide zona de active și selectează opțiunea de retragere/Withdraw.\n\n` +
-
-      `**4️⃣ Alege moneda**\n` +
-      `Selectează moneda pe care NACE o afișează la Deposit.\n\n` +
-
-      `**5️⃣ Copiază adresa din NACE**\n` +
-      `În NACE intră la Deposit și copiază adresa afișată.\n\n` +
-
-      `**6️⃣ Alege REȚEAUA CORECTĂ**\n` +
-      `Rețeaua selectată în OKX trebuie să fie exact aceeași cu cea afișată de NACE.\n\n` +
-
-      `**7️⃣ Verifică înainte de trimitere**\n` +
-      `✔ moneda\n` +
-      `✔ adresa\n` +
-      `✔ rețeaua\n` +
-      `✔ suma\n\n` +
-
-      `**8️⃣ Confirmă retragerea**\n` +
-      `După ce ai verificat toate datele, confirmă transferul.\n\n` +
-
-      `⚠️ **Nu folosi o adresă sau o rețea oferită de altă persoană. Folosește întotdeauna datele afișate în contul tău NACE.**`,
+      `**1️⃣** Intră în OKX și deschide zona de retragere.\n\n` +
+      `**2️⃣** Alege moneda disponibilă pentru depunerea în NACE.\n\n` +
+      `**3️⃣** În NACE intră la Deposit și copiază adresa.\n\n` +
+      `**4️⃣** Selectează exact aceeași rețea în OKX.\n\n` +
+      `**5️⃣** Verifică moneda, adresa, rețeaua și suma.\n\n` +
+      `**6️⃣** Confirmă retragerea.\n\n` +
+      `⚠️ Nu folosi adrese sau rețele primite de la alte persoane.`
   };
 }
-
-/* =========================================================
-   BINANCE
-========================================================= */
 
 function binanceTutorial() {
   return {
     content:
       `🟡 **TUTORIAL BINANCE → NACE**\n\n` +
-
-      `**1️⃣ Creează cont Binance**\n` +
-      `Înregistrează-te și urmează procedura de verificare solicitată de Binance.\n\n` +
-
-      `**2️⃣ Cumpără crypto**\n` +
-      `Cumpără moneda pe care vrei să o trimiți către NACE.\n\n` +
-
-      `**3️⃣ Deschide Withdraw / Retragere**\n` +
-      `Intră în zona de retragere crypto.\n\n` +
-
-      `**4️⃣ Alege moneda**\n` +
-      `Selectează aceeași monedă pe care ai ales-o la Deposit în NACE.\n\n` +
-
-      `**5️⃣ Copiază adresa NACE**\n` +
-      `Intră în NACE → Deposit și copiază adresa afișată acolo.\n\n` +
-
-      `**6️⃣ Selectează rețeaua**\n` +
-      `Alege exact aceeași rețea pe care o afișează NACE pentru depunerea respectivă.\n\n` +
-
-      `**7️⃣ Verifică datele**\n` +
-      `✔ adresa\n` +
-      `✔ moneda\n` +
-      `✔ rețeaua\n` +
-      `✔ suma\n\n` +
-
-      `**8️⃣ Confirmă transferul**\n` +
-      `Confirmă retragerea după ce ai verificat toate datele.\n\n` +
-
-      `⚠️ **O rețea greșită poate duce la pierderea fondurilor. Nu ghici niciodată rețeaua.**`,
+      `**1️⃣** Intră la Withdraw / Retragere.\n\n` +
+      `**2️⃣** Alege moneda.\n\n` +
+      `**3️⃣** În NACE intră la Deposit și copiază adresa.\n\n` +
+      `**4️⃣** Selectează aceeași rețea afișată de NACE.\n\n` +
+      `**5️⃣** Verifică adresa, moneda, rețeaua și suma.\n\n` +
+      `**6️⃣** Confirmă transferul.\n\n` +
+      `⚠️ O rețea greșită poate duce la pierderea fondurilor.`
   };
 }
-
-/* =========================================================
-   BITGET
-========================================================= */
 
 function bitgetTutorial() {
   return {
     content:
       `🔵 **TUTORIAL BITGET → NACE**\n\n` +
-
-      `**1️⃣ Creează cont Bitget**\n` +
-      `Înregistrează-te și finalizează pașii solicitați de Bitget.\n\n` +
-
-      `**2️⃣ Cumpără crypto**\n` +
-      `Cumpără moneda pe care dorești să o transferi către NACE.\n\n` +
-
-      `**3️⃣ Intră la Withdraw**\n` +
-      `Deschide zona de retragere crypto.\n\n` +
-
-      `**4️⃣ Alege moneda**\n` +
-      `Selectează moneda disponibilă pentru depunerea ta în NACE.\n\n` +
-
-      `**5️⃣ Copiază adresa din NACE**\n` +
-      `În NACE deschide Deposit și copiază adresa afișată.\n\n` +
-
-      `**6️⃣ Selectează aceeași rețea**\n` +
-      `Rețeaua din Bitget trebuie să corespundă exact cu cea afișată de NACE.\n\n` +
-
-      `**7️⃣ Verifică totul**\n` +
-      `✔ moneda\n` +
-      `✔ adresa\n` +
-      `✔ rețeaua\n` +
-      `✔ suma\n\n` +
-
-      `**8️⃣ Confirmă transferul**\n` +
-      `După verificarea datelor, confirmă retragerea.\n\n` +
-
-      `⚠️ **Nu trimite fondurile până când moneda, adresa și rețeaua nu au fost verificate.**`,
+      `**1️⃣** Intră la Withdraw.\n\n` +
+      `**2️⃣** Alege moneda.\n\n` +
+      `**3️⃣** În NACE deschide Deposit și copiază adresa.\n\n` +
+      `**4️⃣** Selectează aceeași rețea.\n\n` +
+      `**5️⃣** Verifică toate datele.\n\n` +
+      `**6️⃣** Confirmă transferul.\n\n` +
+      `⚠️ Nu trimite fondurile până nu verifici moneda, adresa și rețeaua.`
   };
 }
-
-/* =========================================================
-   COPY TRADING
-========================================================= */
 
 function copyTradingTutorial() {
   return {
     content:
       `📈 **TUTORIAL COPY TRADING NACE**\n\n` +
-
-      `**1️⃣ Intră în Copy Trading**\n` +
-      `Deschide secțiunea **Copy Trading** din contul NACE.\n\n` +
-
-      `**2️⃣ Analizează traderii**\n` +
-      `Nu alege automat primul trader. Uită-te la informațiile și statisticile disponibile.\n\n` +
-
-      `**3️⃣ Verifică riscul**\n` +
-      `Uită-te la performanță, drawdown, istoricul activității și celelalte date disponibile.\n\n` +
-
-      `**4️⃣ Alege traderul**\n` +
-      `Deschide profilul traderului și verifică informațiile înainte de a începe copierea.\n\n` +
-
-      `**5️⃣ Configurează copierea**\n` +
-      `Alege suma și parametrii disponibili pentru Copy Trading.\n\n` +
-
-      `**6️⃣ Activează Copy Trading**\n` +
-      `Confirmă setările și pornește copierea.\n\n` +
-
-      `**7️⃣ Monitorizează rezultatele**\n` +
-      `Verifică periodic contul și pozițiile copiate.\n\n` +
-
-      `**8️⃣ Oprește copierea**\n` +
-      `Dacă vrei să te oprești, folosește opțiunea disponibilă de Stop/Disable Copy Trading.\n\n` +
-
-      `⚠️ **Important:** Copy Trading nu garantează profit. Poți pierde bani, inclusiv o parte sau toată suma alocată, în funcție de tranzacții și de riscul asumat.`,
+      `**1️⃣** Intră în Copy Trading.\n\n` +
+      `**2️⃣** Analizează traderii disponibili.\n\n` +
+      `**3️⃣** Verifică performanța, drawdown-ul și istoricul.\n\n` +
+      `**4️⃣** Alege traderul.\n\n` +
+      `**5️⃣** Configurează suma și parametrii.\n\n` +
+      `**6️⃣** Activează Copy Trading.\n\n` +
+      `**7️⃣** Monitorizează rezultatele.\n\n` +
+      `⚠️ Copy Trading nu garantează profit și implică risc de pierdere.`
   };
 }
-
-/* =========================================================
-   VERIFICARE CONT
-========================================================= */
 
 function verificationTutorial() {
   return {
     content:
       `📸 **VERIFICAREA CONTULUI NACE**\n\n` +
-
-      `Ai terminat pașii? Trimite screenshot-ul aici în DM.\n\n` +
-
       `Pentru aprobare trebuie să fie vizibile clar:\n\n` +
-
       `☑️ **Verified**\n` +
       `☑️ **Found Account** sau **Trading Account**\n` +
-      `☑️ o sumă de minimum **500**\n\n` +
-
-      `Dacă toate condițiile sunt îndeplinite, botul îți acordă automat rolul **Trader**.\n\n` +
-
-      `🔐 Nu trimite parole, seed phrase, chei private sau coduri 2FA.`,
+      `☑️ Sumă de minimum **500**\n\n` +
+      `Dacă toate condițiile sunt îndeplinite, botul acordă automat rolul **Trader**.\n\n` +
+      `🔐 Nu trimite parole, seed phrase, chei private sau coduri 2FA.`
   };
 }
 
-/* =========================================================
-   BOT READY
-========================================================= */
+/* =========================
+   SEMNALE
+========================= */
 
-client.once("ready", () => {
-  console.log(`NACE Assistant conectat ca ${client.user.tag}`);
-});
+function getRomaniaTime() {
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/Bucharest",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date());
+}
 
-/* =========================================================
-   MEMBRU NOU
-========================================================= */
+function currentRomaniaHourMinute() {
+  const parts = getRomaniaTime();
 
-client.on("guildMemberAdd", async (member) => {
-  try {
-    await member.send(mainMenu());
-  } catch (error) {
+  const hour = Number(
+    parts.find((p) => p.type === "hour")?.value
+  );
+
+  const minute = Number(
+    parts.find((p) => p.type === "minute")?.value
+  );
+
+  return { hour, minute };
+}
+
+function signalMessage(type) {
+  if (type === "normal1") {
+    return (
+      `🚨 **NACE SIGNAL #1** 🚨\n\n` +
+      `🔥 **PRIMUL SEMNAL AL ZILEI ESTE LIVE!**\n\n` +
+      `📊 Verifică semnalul și pregătește-te.\n\n` +
+      `⚡ **NACE TEAM**`
+    );
+  }
+
+  if (type === "normal2") {
+    return (
+      `🚨 **NACE SIGNAL #2** 🚨\n\n` +
+      `🔥 **AL DOILEA SEMNAL AL ZILEI ESTE LIVE!**\n\n` +
+      `📊 Verifică semnalul și pregătește-te.\n\n` +
+      `⚡ **NACE TEAM**`
+    );
+  }
+
+  if (type === "normal3") {
+    return (
+      `🚨 **NACE SIGNAL #3** 🚨\n\n` +
+      `🔥 **AL TREILEA SEMNAL AL ZILEI ESTE LIVE!**\n\n` +
+      `📊 Verifică semnalul și pregătește-te.\n\n` +
+      `⚡ **NACE TEAM**`
+    );
+  }
+
+  if (type === "newMember") {
+    return (
+      `🆕 **NACE NEW MEMBER BONUS** 🆕\n\n` +
+      `🔥 **SEMNALUL BONUS DE LA 13:00 ESTE LIVE!**\n\n` +
+      `Acest semnal este disponibil membrilor aflați în primele 3 zile.\n\n` +
+      `⚡ **NACE TEAM**`
+    );
+  }
+
+  if (type === "teamLeader") {
+    return (
+      `👑 **NACE TEAM LEADER BONUS** 👑\n\n` +
+      `🔥 **SEMNALUL BONUS DE LA 12:30 ESTE LIVE!**\n\n` +
+      `Acest bonus este disponibil Team Leaderilor eligibili.\n\n` +
+      `⚡ **NACE TEAM**`
+    );
+  }
+
+  return "🚨 **NACE SIGNAL LIVE!**";
+}
+
+async function getSignalChannel() {
+  if (!signalChannelId) {
+    return null;
+  }
+
+  const channel = await client.channels
+    .fetch(signalChannelId)
+    .catch(() => null);
+
+  if (!channel || !channel.isTextBased()) {
+    return null;
+  }
+
+  return channel;
+}
+
+async function sendNormalSignal(type) {
+  const channel = await getSignalChannel();
+
+  if (!channel) {
+    console.log(
+      `Semnal ${type}: SIGNAL_CHANNEL_ID nu este configurat.`
+    );
+    return;
+  }
+
+  const guild = await client.guilds.fetch(GUILD_ID);
+
+  const roleMentions = [];
+
+  for (const roleName of NORMAL_SIGNAL_ROLES) {
+    const role = guild.roles.cache.find(
+      (r) => r.name.toLowerCase() === roleName.toLowerCase()
+    );
+
+    if (role) {
+      roleMentions.push(`<@&${role.id}>`);
+    }
+  }
+
+  const content =
+    roleMentions.join(" ") +
+    "\n\n" +
+    signalMessage(type);
+
+  const sent = await channel.send({
+    content,
+    allowedMentions: {
+      roles: roleMentions.map((mention) =>
+        mention.replace(/[<@&>]/g, "")
+      ),
+    },
+  });
+
+  await logSignal(type, channel.id, sent.id);
+}
+
+async function sendEligibleNewMemberSignal() {
+  const channel = await getSignalChannel();
+
+  if (!channel) {
+    console.log(
+      "Semnal 13:00: SIGNAL_CHANNEL_ID nu este configurat."
+    );
+    return;
+  }
+
+  const now = new Date().toISOString();
+
+  const { data, error } = await supabase
+    .from("members")
+    .select("discord_id")
+    .lte("new_member_bonus_start", now)
+    .gte("new_member_bonus_end", now);
+
+  if (error) {
     console.error(
-      `Nu am putut trimite DM către ${member.user.tag}:`,
+      "Eroare membri bonus 13:00:",
       error.message
     );
+    return;
   }
-});
 
-/* =========================================================
-   BUTOANE
-========================================================= */
-
-client.on("interactionCreate", async (interaction) => {
-  try {
-    if (!interaction.isButton()) return;
-
-    if (interaction.customId === "nace_register") {
-      await interaction.reply(registrationTutorial());
-      return;
-    }
-
-    if (interaction.customId === "nace_funding") {
-      await interaction.reply(fundingMenu());
-      return;
-    }
-
-    if (interaction.customId === "fund_okx") {
-      await interaction.reply(okxTutorial());
-      return;
-    }
-
-    if (interaction.customId === "fund_binance") {
-      await interaction.reply(binanceTutorial());
-      return;
-    }
-
-    if (interaction.customId === "fund_bitget") {
-      await interaction.reply(bitgetTutorial());
-      return;
-    }
-
-    if (interaction.customId === "nace_copy") {
-      await interaction.reply(copyTradingTutorial());
-      return;
-    }
-
-    if (interaction.customId === "nace_verify") {
-      await interaction.reply(verificationTutorial());
-      return;
-    }
-  } catch (error) {
-    console.error("Eroare buton:", error);
-
-    if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply(
-        "❌ A apărut o eroare. Încearcă din nou."
-      );
-    }
+  if (!data || data.length === 0) {
+    return;
   }
-});
 
-/* =========================================================
-   SCREENSHOT VERIFICATION
-========================================================= */
+  const mentions = data.map(
+    (member) => `<@${member.discord_id}>`
+  );
 
-client.on("messageCreate", async (message) => {
-  try {
-    if (message.author.bot) return;
+  const sent = await channel.send({
+    content:
+      mentions.join(" ") +
+      "\n\n" +
+      signalMessage("newMember"),
+    allowedMentions: {
+      users: data.map((member) => member.discord_id),
+    },
+  });
 
-    // Screenshoturile se verifică numai prin DM.
-    if (message.guild) return;
+  await logSignal("newMember", channel.id, sent.id);
+}
 
-    const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
+async function sendEligibleTeamLeaderSignal() {
+  const channel = await getSignalChannel();
 
-    if (!guild) {
-      console.error("Serverul Discord nu a fost găsit.");
-      return;
-    }
+  if (!channel) {
+    console.log(
+      "Semnal 12:30: SIGNAL_CHANNEL_ID nu este configurat."
+    );
+    return;
+  }
 
-    const member = await guild.members
-      .fetch(message.author.id)
-      .catch(() => null);
+  const now = new Date().toISOString();
 
-    if (!member) {
-      await message.reply(
-        "Nu te găsesc pe serverul NACE. Intră pe server și încearcă din nou."
-      );
-      return;
-    }
+  const { data, error } = await supabase
+    .from("members")
+    .select("discord_id")
+    .eq("is_team_leader", true)
+    .lte("team_bonus_start", now)
+    .gte("team_bonus_end", now);
 
-    const image = message.attachments.find((attachment) => {
-      return (
-        attachment.contentType &&
-        attachment.contentType.startsWith("image/")
-      );
+  if (error) {
+    console.error(
+      "Eroare Team Leader bonus:",
+      error.message
+    );
+    return;
+  }
+
+  if (!data || data.length === 0) {
+    return;
+  }
+
+  const mentions = data.map(
+    (member) => `<@${member.discord_id}>`
+  );
+
+  const sent = await channel.send({
+    content:
+      mentions.join(" ") +
+      "\n\n" +
+      signalMessage("teamLeader"),
+    allowedMentions: {
+      users: data.map((member) => member.discord_id),
+    },
+  });
+
+  await logSignal("teamLeader", channel.id, sent.id);
+}
+
+async function logSignal(type, channelId, messageId) {
+  const { error } = await supabase
+    .from("signal_logs")
+    .insert({
+      signal_type: type,
+      signal_time: new Date().toISOString(),
+      discord_channel_id: channelId,
+      message_id: messageId,
     });
 
-    // Dacă nu este imagine, nu mai trimitem automat mesajul vechi
-    // despre screenshot. Permitem utilizatorului să discute cu meniul.
-    if (!image) {
-      return;
-    }
-
-    await message.reply(
-      "⏳ Am primit screenshot-ul. Verific dacă apare Verified, contul și suma..."
-    );
-
-    const result = await verifyScreenshot(image.url);
-
-    console.log(
-      `Rezultat verificare pentru ${message.author.tag}:`,
-      result
-    );
-
-    if (result.approved) {
-      await giveTraderRole(member);
-
-      await message.reply(
-        `✅ **Verificarea a fost aprobată!**\n\n` +
-          `☑️ Verified: da\n` +
-          `☑️ Cont: găsit\n` +
-          `💰 Sumă detectată: ${result.amount}\n\n` +
-          `🎉 Ți-am acordat rolul **Trader** pe serverul NACE.`
-      );
-    } else {
-      await message.reply(
-        `❌ **Verificarea nu a fost aprobată.**\n\n` +
-          `${result.reason}\n\n` +
-          `Condițiile necesare sunt:\n` +
-          `• să apară **Verified**;\n` +
-          `• să apară **Found Account** sau **Trading Account**;\n` +
-          `• suma contului să fie de cel puțin **500**.\n\n` +
-          `📸 Trimite un screenshot mai clar și voi verifica din nou.\n\n` +
-          `🔐 Nu trimite parole, seed phrase, chei private sau coduri 2FA.`
-      );
-    }
-  } catch (error) {
-    console.error(
-      "Eroare la verificarea screenshotului:",
-      error
-    );
-
-    try {
-      await message.reply(
-        "❌ A apărut o eroare în timpul verificării. Încearcă din nou."
-      );
-    } catch {}
+  if (error) {
+    console.error("Signal log error:", error.message);
   }
-});
+}
 
-client.login(process.env.DISCORD_TOKEN);
+let lastSignalKey = null;
+
+async function checkSignals() {
+  const { hour, minute } = currentRomaniaHourMinute();
+
+  const key = `${new Date().toISOString().slice(0, 10)}-${hour}-${minute}`;
+
+  if (key === lastSignalKey) {
+    return;
+  }
+
+  if (
+    hour === SIGNAL_TIMES.normal1.hour &&
+    minute === SIGNAL_TIMES.normal1.minute
+  ) {
+    lastSignalKey = key;
+    await sendNormalSignal("normal1");
+  }
+
+  if (
+    hour === SIGNAL_TIMES.teamLeader.hour &&
+    minute === SIGNAL_TIMES.teamLeader.minute
+  ) {
+    lastSignalKey = key;
+    await sendEligibleTeamLeaderSignal();
+  }
+
+  if (
+    hour === SIGNAL_TIMES.newMember.hour &&
+    minute === SIGNAL_TIMES.newMember.minute
+  ) {
+    lastSignalKey = key;
+    await sendEligibleNewMemberSignal();
+  }
+
+  if (
+    hour === SIGNAL_TIMES.normal2.hour &&
+    minute === SIGNAL_TIMES.normal2.minute
+  ) {
+    lastSignalKey = key;
+    await sendNormalSignal("normal2");
+  }
+
+  if (
+    hour === SIGNAL_TIMES.normal3.hour &&
+    minute === SIGNAL_TIMES.normal3.minute
+  ) {
+    lastSignalKey = key;
+    await sendNormalSignal("normal3");
+  }
+}
+
+/* =========================
+   SLASH COMMANDS
+========================= */
+
+const commands = [
+  new SlashCommandBuilder()
+    .setName("status")
+    .setDescription("Vezi statusul tău NACE"),
+
+  new SlashCommandBuilder()
+    .setName("team")
+    .setDescription("Gestionează o echipă")
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("create")
+        .setDescription("Formează o echipă de 5 membri")
+        .addUserOption((option) =>
+          option
+            .setName("member1")
+            .setDescription("Membru 1")
+            .setRequired(true)
+        )
+        .addUserOption((option) =>
+          option
+            .setName("member2")
+            .setDescription("Membru 2")
+            .setRequired(true)
+        )
+        .addUserOption((option) =>
+          option
+            .setName("member3")
+            .setDescription("Membru 3")
+            .setRequired(true)
+        )
+        .addUserOption((option) =>
+          option
+            .setName("member4")
+            .setDescription("Membru 4")
+            .setRequired(true)
+        )
+        .addUserOption((option) =>
+          option
+            .setName("member5")
+            .setDescription("Membru 5")
+            .setRequired(true)
+        )
+    ),
+
+  new SlashCommandBuilder()
+    .setName("admin")
+    .setDescription("Comenzi administrative NACE")
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("member")
+        .setDescription("Vezi datele unui membru")
+        .addUserOption((option) =>
+          option
+            .setName("user")
+            .setDescription("Membrul")
+            .setRequired(true)
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("team")
+        .setDescription("Vezi o echipă")
+        .addUserOption((option) =>
+          option
+            .setName("leader")
+            .setDescription("Team Leader")
+            .setRequired(true)
+        )
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("mem
