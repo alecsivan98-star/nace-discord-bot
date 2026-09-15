@@ -799,31 +799,596 @@ const commands = [
         )
     ),
 
-  new SlashCommandBuilder()
+   new SlashCommandBuilder()
     .setName("admin")
-    .setDescription("Comenzi administrative NACE")
-    .addSubcommand((subcommand) =>
-      subcommand
+    .setDescription("Comenzi administrative")
+    .addSubcommand(sub =>
+      sub
         .setName("member")
-        .setDescription("Vezi datele unui membru")
-        .addUserOption((option) =>
+        .setDescription("Vezi informațiile unui membru")
+        .addUserOption(option =>
           option
             .setName("user")
             .setDescription("Membrul")
             .setRequired(true)
         )
     )
-    .addSubcommand((subcommand) =>
-      subcommand
+    .addSubcommand(sub =>
+      sub
         .setName("team")
-        .setDescription("Vezi o echipă")
-        .addUserOption((option) =>
+        .setDescription("Vezi informațiile unei echipe")
+        .addUserOption(option =>
           option
             .setName("leader")
             .setDescription("Team Leader")
             .setRequired(true)
         )
     )
-    .addSubcommand((subcommand) =>
-      subcommand
-        .setName("mem
+    .addSubcommand(sub =>
+      sub
+        .setName("members")
+        .setDescription("Vezi membrii activi")
+    )
+    .addSubcommand(sub =>
+      sub
+        .setName("teams")
+        .setDescription("Vezi echipele")
+    ),
+];
+
+async function registerCommands() {
+  try {
+    const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
+
+    await rest.put(
+      Routes.applicationGuildCommands(
+        client.user.id,
+        GUILD_ID
+      ),
+      {
+        body: commands.map(command => command.toJSON()),
+      }
+    );
+
+    console.log("Slash commands registered.");
+  } catch (error) {
+    console.error("Error registering slash commands:", error);
+  }
+}
+
+/* =========================
+   BOT READY
+========================= */
+
+client.once("ready", async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+
+  await registerCommands();
+
+  console.log("NACE Assistant is online.");
+
+  checkSignals();
+  setInterval(checkSignals, 30000);
+});
+
+/* =========================
+   MEMBER JOIN
+========================= */
+
+client.on("guildMemberAdd", async member => {
+  try {
+    await saveMember(member);
+
+    await activateNewMemberBonus(member.id);
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("register_nace")
+        .setLabel("🚀 Înregistrare NACE")
+        .setStyle(ButtonStyle.Primary),
+
+      new ButtonBuilder()
+        .setCustomId("funding")
+        .setLabel("💰 Alimentare cont")
+        .setStyle(ButtonStyle.Success),
+
+      new ButtonBuilder()
+        .setCustomId("copy_trading")
+        .setLabel("📈 Copy Trading")
+        .setStyle(ButtonStyle.Secondary),
+
+      new ButtonBuilder()
+        .setCustomId("verify_account")
+        .setLabel("📸 Verificare cont")
+        .setStyle(ButtonStyle.Primary)
+    );
+
+    await member.send({
+      content:
+        `👋 Salut ${member.user.username}!\n\n` +
+        `Bine ai venit în **NACE**.\n\n` +
+        `Folosește butoanele de mai jos pentru a începe.`,
+      components: [row],
+    });
+
+    console.log(`New member joined: ${member.user.tag}`);
+  } catch (error) {
+    console.error("guildMemberAdd error:", error);
+  }
+});
+
+/* =========================
+   BUTTON INTERACTIONS
+========================= */
+
+client.on("interactionCreate", async interaction => {
+  if (!interaction.isButton()) return;
+
+  try {
+    if (interaction.customId === "register_nace") {
+      await interaction.reply({
+        content:
+          `🚀 **Înregistrare NACE**\n\n` +
+          `Intră pe:\n${NACE_URL}\n\n` +
+          `După înregistrare, revino aici pentru verificare.`,
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.customId === "funding") {
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId("fund_okx")
+          .setLabel("OKX")
+          .setStyle(ButtonStyle.Primary),
+
+        new ButtonBuilder()
+          .setCustomId("fund_binance")
+          .setLabel("Binance")
+          .setStyle(ButtonStyle.Primary),
+
+        new ButtonBuilder()
+          .setCustomId("fund_bitget")
+          .setLabel("Bitget")
+          .setStyle(ButtonStyle.Primary)
+      );
+
+      await interaction.reply({
+        content: "💰 Alege platforma:",
+        components: [row],
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (
+      interaction.customId === "fund_okx" ||
+      interaction.customId === "fund_binance" ||
+      interaction.customId === "fund_bitget"
+    ) {
+      await interaction.reply({
+        content:
+          "💰 După ce ai alimentat contul, trimite aici screenshot-ul pentru verificare.\n\n" +
+          "Screenshot-ul trebuie să arate clar:\n" +
+          "• Verified\n" +
+          "• Found Account sau Trading Account\n" +
+          "• suma de minimum 500",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.customId === "copy_trading") {
+      await interaction.reply({
+        content:
+          "📈 **Copy Trading**\n\n" +
+          "Pentru informații despre Copy Trading, contactează echipa NACE.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    if (interaction.customId === "verify_account") {
+      await interaction.reply({
+        content:
+          "📸 Trimite-mi în acest DM screenshot-ul contului tău.\n\n" +
+          "Trebuie să fie vizibile:\n" +
+          "• Verified\n" +
+          "• Found Account sau Trading Account\n" +
+          "• o sumă de minimum 500",
+        ephemeral: true,
+      });
+      return;
+    }
+  } catch (error) {
+    console.error("Button interaction error:", error);
+
+    if (!interaction.replied) {
+      await interaction.reply({
+        content: "A apărut o eroare. Încearcă din nou.",
+        ephemeral: true,
+      });
+    }
+  }
+});
+
+/* =========================
+   SLASH COMMAND INTERACTIONS
+========================= */
+
+client.on("interactionCreate", async interaction => {
+  if (!interaction.isChatInputCommand()) return;
+
+  try {
+    /* =========================
+       STATUS
+    ========================= */
+
+    if (interaction.commandName === "status") {
+      const data = await getMemberData(interaction.user.id);
+
+      if (!data) {
+        await interaction.reply("Nu există date pentru contul tău.");
+        return;
+      }
+
+      const now = new Date();
+
+      const newBonusActive =
+        data.new_member_bonus_end &&
+        new Date(data.new_member_bonus_end) > now;
+
+      const teamBonusActive =
+        data.team_bonus_end &&
+        new Date(data.team_bonus_end) > now;
+
+      await interaction.reply(
+        `📊 **Status NACE – ${interaction.user.username}**\n\n` +
+        `🎁 Bonus membru nou: ${
+          newBonusActive ? "ACTIV" : "INACTIV"
+        }\n` +
+        `👥 Team Leader: ${
+          data.is_team_leader ? "DA" : "NU"
+        }\n` +
+        `🏆 Bonus Team Leader: ${
+          teamBonusActive ? "ACTIV" : "INACTIV"
+        }`
+      );
+
+      return;
+    }
+
+    /* =========================
+       TEAM
+    ========================= */
+
+    if (
+      interaction.commandName === "team" &&
+      interaction.options.getSubcommand() === "create"
+    ) {
+      if (
+        !interaction.member.permissions.has(
+          PermissionsBitField.Flags.ManageGuild
+        )
+      ) {
+        await interaction.reply({
+          content: "Nu ai permisiunea necesară.",
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const members = [];
+
+      for (let i = 1; i <= 5; i++) {
+        const user = interaction.options.getUser(`member${i}`);
+        members.push(user);
+      }
+
+      const ids = members.map(user => user.id);
+
+      if (new Set(ids).size !== 5) {
+        await interaction.reply({
+          content: "Nu poți introduce același membru de mai multe ori.",
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const leader = members[0];
+
+      const result = await createTeamInDatabase(
+        leader.id,
+        ids
+      );
+
+      if (!result.success) {
+        await interaction.reply({
+          content: `❌ ${result.error}`,
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const leaderMember = await interaction.guild.members.fetch(
+        leader.id
+      );
+
+      const teamLeaderRole =
+        interaction.guild.roles.cache.find(
+          role => role.name === "Team Leader"
+        );
+
+      if (teamLeaderRole) {
+        await leaderMember.roles.add(teamLeaderRole);
+      }
+
+      await interaction.reply(
+        `✅ **Echipa a fost creată!**\n\n` +
+        `👑 Team Leader: ${leader}\n` +
+        `👥 Membri: ${members.slice(1).join(", ")}\n\n` +
+        `🎁 Bonus Team Leader activ timp de **20 de zile**.\n` +
+        `⏰ Semnal bonus zilnic la **12:30**.`
+      );
+
+      return;
+    }
+
+    /* =========================
+       ADMIN
+    ========================= */
+
+    if (interaction.commandName === "admin") {
+      if (
+        !interaction.member.permissions.has(
+          PermissionsBitField.Flags.Administrator
+        )
+      ) {
+        await interaction.reply({
+          content: "❌ Nu ai permisiune de Administrator.",
+          ephemeral: true,
+        });
+        return;
+      }
+
+      const subcommand = interaction.options.getSubcommand();
+
+      /* ADMIN MEMBER */
+
+      if (subcommand === "member") {
+        const user = interaction.options.getUser("user");
+
+        const data = await getMemberData(user.id);
+
+        if (!data) {
+          await interaction.reply(
+            `Nu există date pentru ${user}.`
+          );
+          return;
+        }
+
+        await interaction.reply(
+          `👤 **Membru: ${user.username}**\n\n` +
+          `🆔 ID: ${user.id}\n` +
+          `📅 Joined: ${data.joined_at || "-"}\n` +
+          `🎁 Bonus nou: ${data.new_member_bonus_start || "-"} → ${data.new_member_bonus_end || "-"}\n` +
+          `👑 Team Leader: ${data.is_team_leader ? "DA" : "NU"}\n` +
+          `👥 Team ID: ${data.team_id || "-"}\n` +
+          `🏆 Bonus echipă: ${data.team_bonus_start || "-"} → ${data.team_bonus_end || "-"}`
+        );
+
+        return;
+      }
+
+      /* ADMIN TEAM */
+
+      if (subcommand === "team") {
+        const leader = interaction.options.getUser("leader");
+
+        const { data, error } = await supabase
+          .from("teams")
+          .select("*")
+          .eq("leader_discord_id", leader.id)
+          .order("formed_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        if (error) {
+          console.error(error);
+
+          await interaction.reply(
+            "❌ Eroare la citirea echipei."
+          );
+
+          return;
+        }
+
+        if (!data) {
+          await interaction.reply(
+            `Nu există echipă pentru ${leader}.`
+          );
+          return;
+        }
+
+        await interaction.reply(
+          `👥 **Echipa #${data.id}**\n\n` +
+          `👑 Leader: <@${data.leader_discord_id}>\n` +
+          `1️⃣ <@${data.member_1}>\n` +
+          `2️⃣ <@${data.member_2}>\n` +
+          `3️⃣ <@${data.member_3}>\n` +
+          `4️⃣ <@${data.member_4}>\n` +
+          `5️⃣ <@${data.member_5}>\n\n` +
+          `📅 Formată: ${data.formed_at}\n` +
+          `🎁 Bonus: ${data.bonus_start || "-"} → ${data.bonus_end || "-"}`
+        );
+
+        return;
+      }
+
+      /* ADMIN MEMBERS */
+
+      if (subcommand === "members") {
+        const now = new Date().toISOString();
+
+        const { data, error } = await supabase
+          .from("members")
+          .select("*")
+          .or(
+            `new_member_bonus_end.gte.${now},team_bonus_end.gte.${now}`
+          )
+          .order("joined_at", { ascending: false });
+
+        if (error) {
+          console.error(error);
+
+          await interaction.reply(
+            "❌ Eroare la citirea membrilor."
+          );
+
+          return;
+        }
+
+        if (!data || data.length === 0) {
+          await interaction.reply(
+            "Nu există membri cu bonus activ."
+          );
+          return;
+        }
+
+        let text = "👥 **Membri activi**\n\n";
+
+        for (const member of data) {
+          text +=
+            `• <@${member.discord_id}>` +
+            ` | Team Leader: ${member.is_team_leader ? "DA" : "NU"}` +
+            ` | Team: ${member.team_id || "-"}\n`;
+        }
+
+        await interaction.reply(text);
+
+        return;
+      }
+
+      /* ADMIN TEAMS */
+
+      if (subcommand === "teams") {
+        const { data, error } = await supabase
+          .from("teams")
+          .select("*")
+          .order("formed_at", { ascending: false });
+
+        if (error) {
+          console.error(error);
+
+          await interaction.reply(
+            "❌ Eroare la citirea echipelor."
+          );
+
+          return;
+        }
+
+        if (!data || data.length === 0) {
+          await interaction.reply(
+            "Nu există echipe create."
+          );
+          return;
+        }
+
+        let text = "🏆 **Echipe NACE**\n\n";
+
+        for (const team of data) {
+          text +=
+            `**Echipa #${team.id}**\n` +
+            `👑 <@${team.leader_discord_id}>\n` +
+            `👥 <@${team.member_1}> <@${team.member_2}> <@${team.member_3}> <@${team.member_4}> <@${team.member_5}>\n` +
+            `📅 ${team.formed_at}\n\n`;
+        }
+
+        await interaction.reply(text);
+
+        return;
+      }
+    }
+  } catch (error) {
+    console.error("Slash command error:", error);
+
+    if (!interaction.replied) {
+      await interaction.reply({
+        content: "❌ A apărut o eroare.",
+        ephemeral: true,
+      });
+    }
+  }
+});
+
+/* =========================
+   SCREENSHOT VERIFICATION
+========================= */
+
+client.on("messageCreate", async message => {
+  try {
+    if (message.author.bot) return;
+
+    if (!message.guild && message.attachments.size > 0) {
+      const attachment = message.attachments.first();
+
+      const result = await verifyScreenshot(
+        attachment.url
+      );
+
+      if (result.approved) {
+        try {
+          const guild = await client.guilds.fetch(GUILD_ID);
+          const member = await guild.members.fetch(
+            message.author.id
+          );
+
+          const traderRole =
+            guild.roles.cache.get(TRADER_ROLE_ID);
+
+          if (traderRole) {
+            await member.roles.add(traderRole);
+          }
+
+          await message.reply(
+            "✅ **Cont verificat cu succes!**\n\n" +
+            "Ai primit rolul **Trader**."
+          );
+
+          console.log(
+            `Verified member: ${message.author.tag}`
+          );
+        } catch (roleError) {
+          console.error(
+            "Role assignment error:",
+            roleError
+          );
+
+          await message.reply(
+            "Contul a fost verificat, dar nu am putut acorda rolul Trader."
+          );
+        }
+      } else {
+        await message.reply(
+          "❌ Screenshot-ul nu îndeplinește condițiile.\n\n" +
+          "Trebuie să fie vizibile clar:\n" +
+          "• Verified\n" +
+          "• Found Account sau Trading Account\n" +
+          "• suma de minimum 500"
+        );
+      }
+    }
+  } catch (error) {
+    console.error(
+      "Screenshot verification error:",
+      error
+    );
+  }
+});
+
+/* =========================
+   LOGIN
+========================= */
+
+client.login(DISCORD_TOKEN);
