@@ -10,7 +10,7 @@ Discord bot for NACE onboarding, screenshot verification, signals, bonuses and t
 - Normal signals at 12:10, 17:10 and 20:10 Europe/Bucharest, with same-minute duplicate protection.
 - New-member bonus for three days and Team Leader bonus for 20 days.
 - `/status`, `/team create`, and administrator-only `/admin member`, `/admin team`, `/admin members`, `/admin teams`.
-- Invite tracking: four unique, unassigned referrals plus the inviter form an automatic five-person team. The inviter becomes `Team Leader`.
+- Invite tracking: five unique, unassigned referrals plus the inviter form an automatic six-person team. The inviter becomes `Team Leader`.
 
 ## Configuration
 

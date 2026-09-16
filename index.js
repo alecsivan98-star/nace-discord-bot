@@ -203,7 +203,7 @@ async function createTeamInDatabase(leaderId, memberIds) {
   if (memberIds.length !== 5) {
     return {
       success: false,
-      error: "O echipă trebuie să aibă exact 5 membri.",
+      error: "O echipă trebuie să aibă exact 5 membri, pe lângă Team Leader.",
     };
   }
 
@@ -216,10 +216,10 @@ async function createTeamInDatabase(leaderId, memberIds) {
     };
   }
 
-  if (!uniqueIds.includes(leaderId)) {
+  if (uniqueIds.includes(leaderId)) {
     return {
       success: false,
-      error: "Team Leader-ul trebuie să fie unul dintre cei 5 membri.",
+      error: "Team Leader-ul trebuie să fie diferit de cei 5 membri ai echipei.",
     };
   }
 
@@ -254,7 +254,7 @@ async function createTeamInDatabase(leaderId, memberIds) {
     };
   }
 
-  for (const memberId of memberIds) {
+  for (const memberId of [leaderId, ...memberIds]) {
     const isLeader = memberId === leaderId;
 
     const { error } = await supabase
@@ -375,7 +375,7 @@ async function createAutomaticTeamIfEligible(guild, leaderId) {
     (referral) => referral.referred_discord_id
   );
 
-  if (referredIds.length < 4) {
+  if (referredIds.length < 5) {
     return;
   }
 
@@ -389,20 +389,17 @@ async function createAutomaticTeamIfEligible(guild, leaderId) {
     return;
   }
 
-  // A team contains its leader plus four distinct, not-yet-assigned referrals.
+  // A team contains its leader plus five distinct, not-yet-assigned referrals.
   const eligibleIds = (members || [])
     .filter((member) => !member.team_id && !member.is_team_leader)
     .map((member) => member.discord_id)
-    .slice(0, 4);
+    .slice(0, 5);
 
-  if (eligibleIds.length !== 4) {
+  if (eligibleIds.length !== 5) {
     return;
   }
 
-  const result = await createTeamInDatabase(leaderId, [
-    leaderId,
-    ...eligibleIds,
-  ]);
+  const result = await createTeamInDatabase(leaderId, eligibleIds);
 
   if (!result.success) {
     console.error("createAutomaticTeamIfEligible team:", result.error);
@@ -685,7 +682,7 @@ Acesta este semnalul bonus destinat membrilor noi eligibili.
 
 Acesta este semnalul bonus destinat Team Leaderilor eligibili.
 
-⏳ Bonusul Team Leader este activ timp de **20 de zile** după formarea unei echipe complete de 5 membri.
+⏳ Bonusul Team Leader este activ timp de **20 de zile** după formarea unei echipe complete: Team Leader + 5 membri.
 `;
   }
 
@@ -1560,7 +1557,7 @@ Semnalul bonus este programat la:
 
 Pentru formarea unei echipe complete de:
 
-👥 **5 membri**
+👥 **Team Leader + 5 membri**
 
 Team Leader-ul primește o perioadă de bonus de:
 
@@ -1616,7 +1613,7 @@ Vezi statusul tău.
 
 \`/team create\`
 
-Poate fi folosit pentru formarea unei echipe de 5 membri.
+Poate fi folosit pentru formarea unei echipe: Team Leader + 5 membri.
 
 ### 🔐 Siguranță
 
@@ -1648,12 +1645,19 @@ const commands = [
     .addSubcommand((sub) =>
       sub
         .setName("create")
-        .setDescription("Creează o echipă de 5 membri")
+        .setDescription("Creează o echipă: Team Leader + 5 membri")
+
+        .addUserOption((option) =>
+          option
+            .setName("leader")
+            .setDescription("Team Leader")
+            .setRequired(true)
+        )
 
         .addUserOption((option) =>
           option
             .setName("member1")
-            .setDescription("Team Leader")
+            .setDescription("Membru 1")
             .setRequired(true)
         )
 
@@ -1883,7 +1887,7 @@ Semnalele normale sunt programate la:
 
 ### 👑 Team Leader
 
-După formarea unei echipe complete de **5 membri**, Team Leader-ul poate avea o perioadă de bonus de **20 zile**.
+După formarea unei echipe complete de **Team Leader + 5 membri**, Team Leader-ul poate avea o perioadă de bonus de **20 zile**.
 
 Semnalul Team Leader este programat la:
 
@@ -2374,6 +2378,7 @@ ${teamStatus}
         interaction.options.getSubcommand() ===
           "create"
       ) {
+        const leader = interaction.options.getUser("leader");
         const member1 =
           interaction.options.getUser(
             "member1"
@@ -2400,6 +2405,7 @@ ${teamStatus}
           );
 
         const members = [
+          leader,
           member1,
           member2,
           member3,
@@ -2413,11 +2419,11 @@ ${teamStatus}
           );
 
         if (
-          new Set(memberIds).size !== 5
+          new Set(memberIds).size !== 6
         ) {
           await interaction.reply({
             content:
-              "❌ Toți cei 5 membri trebuie să fie diferiți.",
+              "❌ Team Leader-ul și cei 5 membri trebuie să fie persoane diferite.",
             ephemeral: true,
           });
 
@@ -2425,12 +2431,12 @@ ${teamStatus}
         }
 
         const leaderId =
-          member1.id;
+          leader.id;
 
         const result =
           await createTeamInDatabase(
             leaderId,
-            memberIds
+            memberIds.slice(1)
           );
 
         if (!result.success) {
@@ -2476,6 +2482,7 @@ ${teamStatus}
 <@${memberIds[2]}>
 <@${memberIds[3]}>
 <@${memberIds[4]}>
+<@${memberIds[5]}>
 
 📋 Team ID:
 **${result.team.id}**
