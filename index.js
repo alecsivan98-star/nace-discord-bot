@@ -64,6 +64,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildInvites,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.DirectMessages,
   ],
@@ -99,6 +100,7 @@ const SIGNAL_TIMES = {
 };
 
 let lastSignalKey = "";
+const inviteUsesCache = new Map();
 
 /* =========================================================
    UTILS
@@ -284,6 +286,175 @@ async function createTeamInDatabase(leaderId, memberIds) {
     success: true,
     team,
   };
+}
+
+/* =========================================================
+   INVITES / AUTOMATIC TEAM LEADERS
+========================================================= */
+
+async function cacheGuildInvites(guild) {
+  try {
+    const invites = await guild.invites.fetch();
+    const uses = new Map();
+
+    for (const invite of invites.values()) {
+      uses.set(invite.code, invite.uses || 0);
+    }
+
+    inviteUsesCache.set(guild.id, uses);
+    return invites;
+  } catch (error) {
+    // Invite tracking is optional: onboarding must still work if the bot is
+    // missing the Manage Guild permission or Discord does not expose an invite.
+    console.error("cacheGuildInvites:", error);
+    return null;
+  }
+}
+
+async function getInviteUsedForMember(guild) {
+  const previousUses = inviteUsesCache.get(guild.id);
+
+  if (!previousUses) {
+    await cacheGuildInvites(guild);
+    return null;
+  }
+
+  const invites = await cacheGuildInvites(guild);
+
+  if (!invites) {
+    return null;
+  }
+
+  return (
+    [...invites.values()].find(
+      (invite) =>
+        (invite.uses || 0) >
+        (previousUses.get(invite.code) || 0)
+    ) || null
+  );
+}
+
+async function hasExistingTeam(leaderId) {
+  const { data, error } = await supabase
+    .from("teams")
+    .select("id")
+    .eq("leader_discord_id", leaderId)
+    .limit(1);
+
+  if (error) {
+    console.error("hasExistingTeam:", error);
+    return true;
+  }
+
+  return Boolean(data && data.length > 0);
+}
+
+async function createAutomaticTeamIfEligible(guild, leaderId) {
+  const leader = await getMemberData(leaderId);
+
+  if (leader?.is_team_leader || leader?.team_id) {
+    return;
+  }
+
+  if (await hasExistingTeam(leaderId)) {
+    return;
+  }
+
+  const { data: referrals, error: referralError } = await supabase
+    .from("referrals")
+    .select("referred_discord_id, joined_at")
+    .eq("inviter_discord_id", leaderId)
+    .order("joined_at", { ascending: true });
+
+  if (referralError) {
+    console.error("createAutomaticTeamIfEligible referrals:", referralError);
+    return;
+  }
+
+  const referredIds = (referrals || []).map(
+    (referral) => referral.referred_discord_id
+  );
+
+  if (referredIds.length < 4) {
+    return;
+  }
+
+  const { data: members, error: memberError } = await supabase
+    .from("members")
+    .select("discord_id, team_id, is_team_leader")
+    .in("discord_id", referredIds);
+
+  if (memberError) {
+    console.error("createAutomaticTeamIfEligible members:", memberError);
+    return;
+  }
+
+  // A team contains its leader plus four distinct, not-yet-assigned referrals.
+  const eligibleIds = (members || [])
+    .filter((member) => !member.team_id && !member.is_team_leader)
+    .map((member) => member.discord_id)
+    .slice(0, 4);
+
+  if (eligibleIds.length !== 4) {
+    return;
+  }
+
+  const result = await createTeamInDatabase(leaderId, [
+    leaderId,
+    ...eligibleIds,
+  ]);
+
+  if (!result.success) {
+    console.error("createAutomaticTeamIfEligible team:", result.error);
+    return;
+  }
+
+  try {
+    const leaderMember = await guild.members.fetch(leaderId);
+    const teamLeaderRole = guild.roles.cache.find(
+      (role) => role.name === "Team Leader"
+    );
+
+    if (!teamLeaderRole) {
+      console.error("Team Leader role was not found after automatic team creation.");
+      return;
+    }
+
+    if (!leaderMember.roles.cache.has(teamLeaderRole.id)) {
+      await leaderMember.roles.add(teamLeaderRole);
+    }
+
+    console.log(
+      `✅ Team Leader promoted automatically: ${leaderId} | team=${result.team.id}`
+    );
+  } catch (error) {
+    console.error("createAutomaticTeamIfEligible role:", error);
+  }
+}
+
+async function recordReferralAndCheckTeam(member, invite) {
+  if (!invite?.inviter?.id || invite.inviter.id === member.id) {
+    return;
+  }
+
+  const { error } = await supabase
+    .from("referrals")
+    .insert({
+      inviter_discord_id: invite.inviter.id,
+      referred_discord_id: member.id,
+      invite_code: invite.code,
+      joined_at: new Date().toISOString(),
+    });
+
+  if (error) {
+    // A unique constraint on referred_discord_id makes repeated member events safe.
+    if (error.code !== "23505") {
+      console.error("recordReferralAndCheckTeam:", error);
+    }
+    return;
+  }
+
+  await createAutomaticTeamIfEligible(member.guild, invite.inviter.id);
 }
 
 /* =========================================================
@@ -768,8 +939,8 @@ async function checkSignals() {
       time.hour === "12" &&
       time.minute === "10"
     ) {
-      await sendNormalSignal("signal_1");
       lastSignalKey = key;
+      await sendNormalSignal("signal_1");
       return;
     }
 
@@ -777,8 +948,8 @@ async function checkSignals() {
       time.hour === "12" &&
       time.minute === "30"
     ) {
-      await sendEligibleTeamLeaderSignal();
       lastSignalKey = key;
+      await sendEligibleTeamLeaderSignal();
       return;
     }
 
@@ -786,8 +957,8 @@ async function checkSignals() {
       time.hour === "13" &&
       time.minute === "00"
     ) {
-      await sendEligibleNewMemberSignal();
       lastSignalKey = key;
+      await sendEligibleNewMemberSignal();
       return;
     }
 
@@ -795,8 +966,8 @@ async function checkSignals() {
       time.hour === "17" &&
       time.minute === "10"
     ) {
-      await sendNormalSignal("signal_2");
       lastSignalKey = key;
+      await sendNormalSignal("signal_2");
       return;
     }
 
@@ -804,8 +975,8 @@ async function checkSignals() {
       time.hour === "20" &&
       time.minute === "10"
     ) {
-      await sendNormalSignal("signal_3");
       lastSignalKey = key;
+      await sendNormalSignal("signal_3");
       return;
     }
   } catch (error) {
@@ -1608,6 +1779,13 @@ client.once("clientReady", async () => {
 
   await registerCommands();
 
+  try {
+    const guild = await client.guilds.fetch(GUILD_ID);
+    await cacheGuildInvites(guild);
+  } catch (error) {
+    console.error("Initial invite cache:", error);
+  }
+
   console.log(
     "🤖 NACE Assistant is online."
   );
@@ -1618,6 +1796,14 @@ client.once("clientReady", async () => {
     checkSignals,
     30 * 1000
   );
+});
+
+client.on("inviteCreate", async (invite) => {
+  await cacheGuildInvites(invite.guild);
+});
+
+client.on("inviteDelete", async (invite) => {
+  await cacheGuildInvites(invite.guild);
 });
 
 /* =========================================================
@@ -1637,6 +1823,16 @@ client.on(
       await activateNewMemberBonus(
         member.id
       );
+
+      const usedInvite = await getInviteUsedForMember(member.guild);
+
+      if (usedInvite) {
+        await recordReferralAndCheckTeam(member, usedInvite);
+      } else {
+        console.log(
+          `ℹ️ Invite could not be identified safely for ${member.user.tag}.`
+        );
+      }
 
       const welcomeEmbed =
         new EmbedBuilder()
