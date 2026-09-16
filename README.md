@@ -8,7 +8,7 @@ Discord bot for NACE onboarding, screenshot verification, signals, bonuses and t
 - Screenshot verification through OpenAI Vision; approval requires a clearly visible `Verified`, `Found Account` or `Trading Account`, and an amount of at least 500.
 - `Trader` role assignment after approval.
 - Normal signals at 12:10, 17:10 and 20:10 Europe/Bucharest, with same-minute duplicate protection.
-- New-member bonus for three days and Team Leader bonus for 20 days.
+- New-member bonus for three days, activated only after the member confirms in DM that they are connected to the professor's signals; Team Leader bonus for 20 days.
 - `/status`, `/team create`, and administrator-only `/admin member`, `/admin team`, `/admin members`, `/admin teams`.
 - Invite tracking: five unique, unassigned referrals plus the inviter form an automatic six-person team. The inviter becomes `Team Leader`.
 

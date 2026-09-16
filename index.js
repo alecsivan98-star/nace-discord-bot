@@ -181,18 +181,46 @@ async function activateNewMemberBonus(discordId) {
     start.getTime() + 3 * 24 * 60 * 60 * 1000
   );
 
-  const { error } = await supabase
+  const { data, error } = await supabase
     .from("members")
     .update({
       new_member_bonus_start: start.toISOString(),
       new_member_bonus_end: end.toISOString(),
       updated_at: new Date().toISOString(),
     })
-    .eq("discord_id", discordId);
+    .eq("discord_id", discordId)
+    .is("new_member_bonus_start", null)
+    .is("new_member_bonus_end", null)
+    .select("new_member_bonus_end")
+    .maybeSingle();
 
   if (error) {
     console.error("activateNewMemberBonus:", error);
+    return { success: false };
   }
+
+  if (data) {
+    return {
+      success: true,
+      activated: true,
+      endsAt: data.new_member_bonus_end,
+    };
+  }
+
+  const memberData = await getMemberData(discordId);
+
+  if (!memberData) {
+    console.error(
+      `activateNewMemberBonus: member ${discordId} was not found.`
+    );
+    return { success: false };
+  }
+
+  return {
+    success: true,
+    activated: false,
+    endsAt: memberData.new_member_bonus_end,
+  };
 }
 
 /* =========================================================
@@ -1025,6 +1053,26 @@ function tutorialButtons() {
   return [row1, row2, row3];
 }
 
+function newMemberBonusButtons(includeNotYet = true) {
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("new_member_bonus_yes")
+      .setLabel("Da, sunt conectat")
+      .setStyle(ButtonStyle.Success)
+  );
+
+  if (includeNotYet) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId("new_member_bonus_not_yet")
+        .setLabel("Nu încă")
+        .setStyle(ButtonStyle.Secondary)
+    );
+  }
+
+  return [row];
+}
+
 /* =========================================================
    REGISTRATION TUTORIAL
 ========================================================= */
@@ -1545,6 +1593,8 @@ Program:
 
 La intrarea pe server, membrul este înregistrat în sistem.
 
+În mesaj privat, botul întreabă dacă membrul este conectat la semnalele dlui profesor. Bonusul începe numai după răspunsul **Da**.
+
 Perioada bonusului:
 
 ⏳ **3 zile**
@@ -1824,10 +1874,6 @@ client.on(
 
       await saveMember(member);
 
-      await activateNewMemberBonus(
-        member.id
-      );
-
       const usedInvite = await getInviteUsedForMember(member.guild);
 
       if (usedInvite) {
@@ -1871,7 +1917,7 @@ După ce ai finalizat pașii necesari, poți trimite screenshot-ul pentru verifi
 
 ### 🎁 Bonus membru nou
 
-Ai fost înregistrat automat pentru perioada de bonus de **3 zile**.
+După ce confirmi în mesajul următor că ești conectat la semnalele dlui profesor, îți activez bonusul de **3 zile**.
 
 Semnalul bonus pentru membrii noi este programat la:
 
@@ -1907,6 +1953,12 @@ Apasă butoanele de mai jos pentru tutorialul dorit.
 
       await member.send({
         content:
+          "🎁 **Activare bonus membru nou**\n\nEști conectat la semnalele dlui profesor?\n\nDacă alegi **Da**, activez bonusul pentru 3 zile.",
+        components: newMemberBonusButtons(),
+      });
+
+      await member.send({
+        content:
           "📖 **RECOMANDAREA MEA:** începe cu **🚀 Înregistrare NACE**, apoi continuă cu alimentarea, Copy Trading și, la final, verificarea contului.",
       });
 
@@ -1932,6 +1984,66 @@ client.on(
     if (!interaction.isButton()) return;
 
     try {
+      /* =========================
+         NEW MEMBER BONUS
+      ========================= */
+
+      if (
+        interaction.customId ===
+        "new_member_bonus_yes"
+      ) {
+        await interaction.deferUpdate();
+
+        const result = await activateNewMemberBonus(
+          interaction.user.id
+        );
+
+        if (!result.success) {
+          await interaction.editReply({
+            content:
+              "❌ Nu am putut activa bonusul acum. Încearcă din nou peste câteva secunde.",
+            components: newMemberBonusButtons(false),
+          });
+          return;
+        }
+
+        if (result.activated) {
+          const endsAt = Math.floor(
+            new Date(result.endsAt).getTime() / 1000
+          );
+
+          await interaction.editReply({
+            content: `✅ Bonusul tău de membru nou este activ pentru **3 zile**, până la <t:${endsAt}:F>. Vei primi semnalul bonus programat la **13:00**.`,
+            components: [],
+          });
+          return;
+        }
+
+        const endsAt = result.endsAt
+          ? ` până la <t:${Math.floor(
+              new Date(result.endsAt).getTime() / 1000
+            )}:F>`
+          : "";
+
+        await interaction.editReply({
+          content: `ℹ️ Bonusul de membru nou a fost deja activat${endsAt}.`,
+          components: [],
+        });
+        return;
+      }
+
+      if (
+        interaction.customId ===
+        "new_member_bonus_not_yet"
+      ) {
+        await interaction.update({
+          content:
+            "În regulă. Bonusul nu este activ acum. Când ești conectat la semnalele dlui profesor, apasă **Da, sunt conectat**.",
+          components: newMemberBonusButtons(false),
+        });
+        return;
+      }
+
       /* =========================
          REGISTER
       ========================= */
