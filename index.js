@@ -101,6 +101,13 @@ const SIGNAL_TIMES = {
 
 let lastSignalKey = "";
 const inviteUsesCache = new Map();
+const TEAM_MEMBER_COLUMNS = [
+  "member_1",
+  "member_2",
+  "member_3",
+  "member_4",
+  "member_5",
+];
 
 /* =========================================================
    UTILS
@@ -109,6 +116,14 @@ const inviteUsesCache = new Map();
 function isAdmin(interaction) {
   return interaction.memberPermissions?.has(
     PermissionsBitField.Flags.Administrator
+  );
+}
+
+function isGuildOwnerOrAdmin(interaction) {
+  return Boolean(
+    interaction.guild &&
+      (interaction.user.id === interaction.guild.ownerId ||
+        isAdmin(interaction))
   );
 }
 
@@ -316,6 +331,675 @@ async function createTeamInDatabase(leaderId, memberIds) {
   };
 }
 
+function getTeamMemberIds(team) {
+  return TEAM_MEMBER_COLUMNS.map(
+    (column) => team?.[column]
+  ).filter(Boolean);
+}
+
+function formatTeamDraftProgress(draft) {
+  const memberCount = getTeamMemberIds(draft).length;
+  const slots = TEAM_MEMBER_COLUMNS.map(
+    (column, index) =>
+      `${index + 1}. ${
+        draft[column]
+          ? `<@${draft[column]}>`
+          : "— loc liber —"
+      }`
+  ).join("\n");
+
+  return `
+🧩 **ECHIPĂ ÎN CONSTRUCȚIE**
+
+👑 Team Leader propus:
+<@${draft.leader_discord_id}>
+
+👥 Membri (${memberCount}/5):
+${slots}
+
+Mai sunt necesari **${5 - memberCount} membri**. Rolul Team Leader și bonusul de 20 de zile se activează automat doar când echipa este completă.
+`;
+}
+
+async function getTeamDraft(leaderId) {
+  const { data, error } = await supabase
+    .from("team_drafts")
+    .select("*")
+    .eq("leader_discord_id", leaderId)
+    .maybeSingle();
+
+  if (error) {
+    console.error("getTeamDraft:", error);
+    return { success: false, draft: null };
+  }
+
+  return { success: true, draft: data };
+}
+
+async function getTeamDraftContainingMember(memberId) {
+  const filter = TEAM_MEMBER_COLUMNS.map(
+    (column) => `${column}.eq.${memberId}`
+  ).join(",");
+
+  const { data, error } = await supabase
+    .from("team_drafts")
+    .select("*")
+    .or(filter)
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    console.error("getTeamDraftContainingMember:", error);
+    return { success: false, draft: null };
+  }
+
+  return { success: true, draft: data };
+}
+
+async function getCompletedTeamContainingMember(discordId) {
+  const filter = [
+    "leader_discord_id",
+    ...TEAM_MEMBER_COLUMNS,
+  ]
+    .map((column) => `${column}.eq.${discordId}`)
+    .join(",");
+
+  const { data, error } = await supabase
+    .from("teams")
+    .select("id, leader_discord_id")
+    .or(filter)
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    console.error("getCompletedTeamContainingMember:", error);
+    return { success: false, team: null };
+  }
+
+  return { success: true, team: data };
+}
+
+function isDraftFinalizationStale(draft) {
+  if (!draft?.is_finalizing || !draft.finalizing_at) return false;
+
+  return (
+    Date.now() - new Date(draft.finalizing_at).getTime() >
+    5 * 60 * 1000
+  );
+}
+
+async function ensureGuildMembersExist(guild, memberIds) {
+  try {
+    await Promise.all(
+      memberIds.map((memberId) => guild.members.fetch(memberId))
+    );
+    return { success: true };
+  } catch (error) {
+    console.error("ensureGuildMembersExist:", error);
+    return {
+      success: false,
+      error: "Toți membrii trebuie să fie încă pe server pentru a finaliza echipa.",
+    };
+  }
+}
+
+async function validateTeamDraftLeader(leaderId) {
+  const leaderData = await getMemberData(leaderId);
+
+  if (leaderData?.is_team_leader || leaderData?.team_id) {
+    return {
+      success: false,
+      error: "Acest Team Leader are deja o echipă completă.",
+    };
+  }
+
+  if (await hasExistingTeam(leaderId)) {
+    return {
+      success: false,
+      error: "Acest Team Leader are deja o echipă înregistrată.",
+    };
+  }
+
+  const completedTeam = await getCompletedTeamContainingMember(leaderId);
+
+  if (!completedTeam.success) {
+    return {
+      success: false,
+      error: "Nu am putut verifica echipele existente.",
+    };
+  }
+
+  if (completedTeam.team) {
+    return {
+      success: false,
+      error: "Acest Team Leader face deja parte dintr-o echipă completă.",
+    };
+  }
+
+  const draftMembership = await getTeamDraftContainingMember(leaderId);
+
+  if (!draftMembership.success) {
+    return {
+      success: false,
+      error: "Nu am putut verifica echipele în construcție.",
+    };
+  }
+
+  if (draftMembership.draft) {
+    return {
+      success: false,
+      error: "Acest Team Leader este deja membru într-o altă echipă în construcție.",
+    };
+  }
+
+  return { success: true };
+}
+
+async function validateTeamDraftMember(leaderId, memberId) {
+  if (leaderId === memberId) {
+    return {
+      success: false,
+      error: "Team Leader-ul nu poate fi adăugat ca membru în propria echipă.",
+    };
+  }
+
+  const memberData = await getMemberData(memberId);
+
+  if (memberData?.is_team_leader || memberData?.team_id) {
+    return {
+      success: false,
+      error: "Acest membru face deja parte dintr-o echipă.",
+    };
+  }
+
+  const completedTeam = await getCompletedTeamContainingMember(memberId);
+
+  if (!completedTeam.success) {
+    return {
+      success: false,
+      error: "Nu am putut verifica echipele existente.",
+    };
+  }
+
+  if (completedTeam.team) {
+    return {
+      success: false,
+      error: "Acest membru face deja parte dintr-o echipă completă.",
+    };
+  }
+
+  const draftMembership = await getTeamDraftContainingMember(memberId);
+
+  if (!draftMembership.success) {
+    return {
+      success: false,
+      error: "Nu am putut verifica echipele în construcție.",
+    };
+  }
+
+  if (
+    draftMembership.draft &&
+    draftMembership.draft.leader_discord_id !== leaderId
+  ) {
+    return {
+      success: false,
+      error: "Acest membru este deja adăugat într-o altă echipă în construcție.",
+    };
+  }
+
+  return { success: true };
+}
+
+async function storeTeamDraftMember(leaderId, memberId) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const draftResult = await getTeamDraft(leaderId);
+
+    if (!draftResult.success) {
+      return {
+        success: false,
+        error: "Nu am putut accesa echipa în construcție.",
+      };
+    }
+
+    const draft = draftResult.draft;
+
+    if (!draft) {
+      const { data, error } = await supabase
+        .from("team_drafts")
+        .insert({
+          leader_discord_id: leaderId,
+          member_1: memberId,
+          updated_at: new Date().toISOString(),
+        })
+        .select("*")
+        .maybeSingle();
+
+      if (error) {
+        if (error.code === "23505") continue;
+
+        console.error("storeTeamDraftMember insert:", error);
+        return {
+          success: false,
+          error: "Nu am putut crea echipa în construcție.",
+        };
+      }
+
+      return { success: true, draft: data, added: true };
+    }
+
+    const memberIds = getTeamMemberIds(draft);
+
+    if (memberIds.includes(memberId)) {
+      return { success: true, draft, added: false };
+    }
+
+    if (draft.is_finalizing) {
+      if (isDraftFinalizationStale(draft)) {
+        const { data, error } = await supabase
+          .from("team_drafts")
+          .update({
+            is_finalizing: false,
+            finalizing_at: null,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("leader_discord_id", leaderId)
+          .eq("is_finalizing", true)
+          .eq("finalizing_at", draft.finalizing_at)
+          .select("*")
+          .maybeSingle();
+
+        if (error) {
+          console.error("storeTeamDraftMember unlock:", error);
+          return {
+            success: false,
+            error: "Nu am putut debloca finalizarea echipei.",
+          };
+        }
+
+        if (data) continue;
+      }
+
+      return {
+        success: false,
+        error: "Echipa se finalizează acum. Încearcă din nou peste câteva secunde.",
+      };
+    }
+
+    const openSlot = TEAM_MEMBER_COLUMNS.find(
+      (column) => !draft[column]
+    );
+
+    if (!openSlot) {
+      return { success: true, draft, added: false };
+    }
+
+    const { data, error } = await supabase
+      .from("team_drafts")
+      .update({
+        [openSlot]: memberId,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("leader_discord_id", leaderId)
+      .eq("is_finalizing", false)
+      .is(openSlot, null)
+      .select("*")
+      .maybeSingle();
+
+    if (error) {
+      console.error("storeTeamDraftMember update:", error);
+      return {
+        success: false,
+        error: "Nu am putut adăuga membrul în echipă.",
+      };
+    }
+
+    if (data) {
+      return { success: true, draft: data, added: true };
+    }
+  }
+
+  return {
+    success: false,
+    error: "Echipa a fost modificată simultan. Încearcă din nou.",
+  };
+}
+
+async function assignTeamLeaderRole(guild, leaderId) {
+  try {
+    const leaderMember = await guild.members.fetch(leaderId);
+    const teamLeaderRole = guild.roles.cache.find(
+      (role) => role.name === "Team Leader"
+    );
+
+    if (!teamLeaderRole) {
+      return {
+        success: false,
+        error: "Nu găsesc rolul Discord Team Leader.",
+      };
+    }
+
+    if (!leaderMember.roles.cache.has(teamLeaderRole.id)) {
+      await leaderMember.roles.add(teamLeaderRole);
+    }
+
+    return { success: true };
+  } catch (error) {
+    console.error("assignTeamLeaderRole:", error);
+    return {
+      success: false,
+      error: "Echipa a fost salvată, dar rolul Team Leader nu a putut fi acordat automat.",
+    };
+  }
+}
+
+async function finalizeTeamDraft(guild, leaderId) {
+  const draftResult = await getTeamDraft(leaderId);
+
+  if (!draftResult.success || !draftResult.draft) {
+    return {
+      success: false,
+      error: "Nu am găsit echipa în construcție.",
+    };
+  }
+
+  const draft = draftResult.draft;
+  const memberIds = getTeamMemberIds(draft);
+
+  if (memberIds.length < 5) {
+    return { success: true, completed: false, draft };
+  }
+
+  if (draft.is_finalizing) {
+    if (isDraftFinalizationStale(draft)) {
+      const { error } = await supabase
+        .from("team_drafts")
+        .update({
+          is_finalizing: false,
+          finalizing_at: null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("leader_discord_id", leaderId)
+        .eq("is_finalizing", true)
+        .eq("finalizing_at", draft.finalizing_at);
+
+      if (error) {
+        console.error("finalizeTeamDraft unlock:", error);
+        return {
+          success: false,
+          error: "Nu am putut relua finalizarea echipei.",
+        };
+      }
+
+      return finalizeTeamDraft(guild, leaderId);
+    }
+
+    return {
+      success: true,
+      completed: false,
+      finalizing: true,
+      draft,
+    };
+  }
+
+  const { data: claimedDraft, error: claimError } = await supabase
+    .from("team_drafts")
+    .update({
+      is_finalizing: true,
+      finalizing_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("leader_discord_id", leaderId)
+    .eq("is_finalizing", false)
+    .select("*")
+    .maybeSingle();
+
+  if (claimError) {
+    console.error("finalizeTeamDraft claim:", claimError);
+    return {
+      success: false,
+      error: "Nu am putut finaliza echipa acum.",
+    };
+  }
+
+  if (!claimedDraft) {
+    return {
+      success: true,
+      completed: false,
+      finalizing: true,
+      draft,
+    };
+  }
+
+  const guildMemberCheck = await ensureGuildMembersExist(
+    guild,
+    [leaderId, ...getTeamMemberIds(claimedDraft)]
+  );
+
+  if (!guildMemberCheck.success) {
+    await supabase
+      .from("team_drafts")
+      .update({
+        is_finalizing: false,
+        finalizing_at: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("leader_discord_id", leaderId)
+      .eq("is_finalizing", true);
+
+    return guildMemberCheck;
+  }
+
+  const result = await createTeamInDatabase(
+    leaderId,
+    getTeamMemberIds(claimedDraft)
+  );
+
+  if (!result.success) {
+    await supabase
+      .from("team_drafts")
+      .update({
+        is_finalizing: false,
+        finalizing_at: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("leader_discord_id", leaderId);
+
+    return result;
+  }
+
+  const { error: deleteError } = await supabase
+    .from("team_drafts")
+    .delete()
+    .eq("leader_discord_id", leaderId);
+
+  if (deleteError) {
+    console.error("finalizeTeamDraft delete:", deleteError);
+  }
+
+  const roleResult = await assignTeamLeaderRole(guild, leaderId);
+
+  return {
+    success: true,
+    completed: true,
+    team: result.team,
+    roleResult,
+  };
+}
+
+async function addMemberToTeamDraft(guild, leaderId, memberId) {
+  const leaderCheck = await validateTeamDraftLeader(leaderId);
+
+  if (!leaderCheck.success) return leaderCheck;
+
+  const memberCheck = await validateTeamDraftMember(leaderId, memberId);
+
+  if (!memberCheck.success) return memberCheck;
+
+  const stored = await storeTeamDraftMember(leaderId, memberId);
+
+  if (!stored.success) return stored;
+
+  if (getTeamMemberIds(stored.draft).length < 5) {
+    return {
+      success: true,
+      completed: false,
+      draft: stored.draft,
+      added: stored.added,
+    };
+  }
+
+  const finalized = await finalizeTeamDraft(guild, leaderId);
+
+  return {
+    ...finalized,
+    added: stored.added,
+  };
+}
+
+async function removeMemberFromTeamDraft(leaderId, memberId) {
+  const draftResult = await getTeamDraft(leaderId);
+
+  if (!draftResult.success) {
+    return {
+      success: false,
+      error: "Nu am putut accesa echipa în construcție.",
+    };
+  }
+
+  const draft = draftResult.draft;
+
+  if (!draft) {
+    return {
+      success: false,
+      error: "Nu există o echipă în construcție pentru acest Team Leader.",
+    };
+  }
+
+  if (draft.is_finalizing) {
+    return {
+      success: false,
+      error: "Echipa se finalizează acum și nu mai poate fi modificată.",
+    };
+  }
+
+  const memberSlot = TEAM_MEMBER_COLUMNS.find(
+    (column) => draft[column] === memberId
+  );
+
+  if (!memberSlot) {
+    return {
+      success: false,
+      error: "Acest membru nu se află în echipa în construcție.",
+    };
+  }
+
+  const { data, error } = await supabase
+    .from("team_drafts")
+    .update({
+      [memberSlot]: null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("leader_discord_id", leaderId)
+    .eq("is_finalizing", false)
+    .eq(memberSlot, memberId)
+    .select("*")
+    .maybeSingle();
+
+  if (error) {
+    console.error("removeMemberFromTeamDraft:", error);
+    return {
+      success: false,
+      error: "Nu am putut scoate membrul din echipă.",
+    };
+  }
+
+  if (!data) {
+    return {
+      success: false,
+      error: "Echipa a fost modificată simultan. Verifică din nou statusul.",
+    };
+  }
+
+  return { success: true, draft: data };
+}
+
+async function cancelTeamDraft(leaderId) {
+  const draftResult = await getTeamDraft(leaderId);
+
+  if (!draftResult.success) {
+    return {
+      success: false,
+      error: "Nu am putut accesa echipa în construcție.",
+    };
+  }
+
+  if (!draftResult.draft) {
+    return {
+      success: false,
+      error: "Nu există o echipă în construcție pentru acest Team Leader.",
+    };
+  }
+
+  if (draftResult.draft.is_finalizing) {
+    return {
+      success: false,
+      error: "Echipa se finalizează acum și nu poate fi anulată.",
+    };
+  }
+
+  const { error } = await supabase
+    .from("team_drafts")
+    .delete()
+    .eq("leader_discord_id", leaderId)
+    .eq("is_finalizing", false);
+
+  if (error) {
+    console.error("cancelTeamDraft:", error);
+    return {
+      success: false,
+      error: "Nu am putut anula echipa în construcție.",
+    };
+  }
+
+  return { success: true };
+}
+
+async function getCompletedTeamByLeader(leaderId) {
+  const { data, error } = await supabase
+    .from("teams")
+    .select("*")
+    .eq("leader_discord_id", leaderId)
+    .order("formed_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    console.error("getCompletedTeamByLeader:", error);
+    return { success: false, team: null };
+  }
+
+  return { success: true, team: data };
+}
+
+function formatCompletedTeamStatus(team) {
+  const members = getTeamMemberIds(team)
+    .map((memberId, index) => `${index + 1}. <@${memberId}>`)
+    .join("\n");
+
+  return `
+✅ **ECHIPĂ COMPLETĂ**
+
+👑 Team Leader:
+<@${team.leader_discord_id}>
+
+👥 Membri:
+${members}
+
+📋 Team ID: **${team.id}**
+🎁 Bonus Team Leader: **20 zile**
+`;
+}
+
 /* =========================================================
    INVITES / AUTOMATIC TEAM LEADERS
 ========================================================= */
@@ -388,6 +1072,21 @@ async function createAutomaticTeamIfEligible(guild, leaderId) {
     return;
   }
 
+  const draftResult = await getTeamDraft(leaderId);
+
+  if (!draftResult.success) {
+    return;
+  }
+
+  // A draft means an owner/admin is choosing the members manually. Do not
+  // create a second automatic team for the same leader in the meantime.
+  if (draftResult.draft) {
+    console.log(
+      `ℹ️ Automatic team creation skipped for ${leaderId}: manual draft exists.`
+    );
+    return;
+  }
+
   const { data: referrals, error: referralError } = await supabase
     .from("referrals")
     .select("referred_discord_id, joined_at")
@@ -434,26 +1133,17 @@ async function createAutomaticTeamIfEligible(guild, leaderId) {
     return;
   }
 
-  try {
-    const leaderMember = await guild.members.fetch(leaderId);
-    const teamLeaderRole = guild.roles.cache.find(
-      (role) => role.name === "Team Leader"
-    );
+  const roleResult = await assignTeamLeaderRole(guild, leaderId);
 
-    if (!teamLeaderRole) {
-      console.error("Team Leader role was not found after automatic team creation.");
-      return;
-    }
-
-    if (!leaderMember.roles.cache.has(teamLeaderRole.id)) {
-      await leaderMember.roles.add(teamLeaderRole);
-    }
-
+  if (roleResult.success) {
     console.log(
       `✅ Team Leader promoted automatically: ${leaderId} | team=${result.team.id}`
     );
-  } catch (error) {
-    console.error("createAutomaticTeamIfEligible role:", error);
+  } else {
+    console.error(
+      "createAutomaticTeamIfEligible role:",
+      roleResult.error
+    );
   }
 }
 
@@ -1663,7 +2353,11 @@ Vezi statusul tău.
 
 \`/team create\`
 
-Poate fi folosit pentru formarea unei echipe: Team Leader + 5 membri.
+Ownerul sau un administrator poate începe o echipă cu un singur membru.
+
+\`/team add\`
+
+Adaugă următorul membru. Rolul Team Leader și bonusul de 20 de zile pornesc doar când sunt 5 membri plus liderul.
 
 ### 🔐 Siguranță
 
@@ -1695,47 +2389,77 @@ const commands = [
     .addSubcommand((sub) =>
       sub
         .setName("create")
-        .setDescription("Creează o echipă: Team Leader + 5 membri")
-
+        .setDescription("Începe o echipă cu primul membru")
         .addUserOption((option) =>
           option
             .setName("leader")
-            .setDescription("Team Leader")
+            .setDescription("Team Leader propus")
             .setRequired(true)
         )
-
         .addUserOption((option) =>
           option
-            .setName("member1")
-            .setDescription("Membru 1")
+            .setName("member")
+            .setDescription("Primul membru al echipei")
             .setRequired(true)
         )
+    )
 
+    .addSubcommand((sub) =>
+      sub
+        .setName("add")
+        .setDescription("Adaugă un membru într-o echipă în construcție")
         .addUserOption((option) =>
           option
-            .setName("member2")
-            .setDescription("Membru 2")
+            .setName("leader")
+            .setDescription("Team Leader propus")
             .setRequired(true)
         )
-
         .addUserOption((option) =>
           option
-            .setName("member3")
-            .setDescription("Membru 3")
+            .setName("member")
+            .setDescription("Membrul de adăugat")
             .setRequired(true)
         )
+    )
 
+    .addSubcommand((sub) =>
+      sub
+        .setName("remove")
+        .setDescription("Scoate un membru dintr-o echipă în construcție")
         .addUserOption((option) =>
           option
-            .setName("member4")
-            .setDescription("Membru 4")
+            .setName("leader")
+            .setDescription("Team Leader propus")
             .setRequired(true)
         )
-
         .addUserOption((option) =>
           option
-            .setName("member5")
-            .setDescription("Membru 5")
+            .setName("member")
+            .setDescription("Membrul de scos")
+            .setRequired(true)
+        )
+    )
+
+    .addSubcommand((sub) =>
+      sub
+        .setName("cancel")
+        .setDescription("Anulează o echipă în construcție")
+        .addUserOption((option) =>
+          option
+            .setName("leader")
+            .setDescription("Team Leader propus")
+            .setRequired(true)
+        )
+    )
+
+    .addSubcommand((sub) =>
+      sub
+        .setName("status")
+        .setDescription("Vezi progresul unei echipe")
+        .addUserOption((option) =>
+          option
+            .setName("leader")
+            .setDescription("Team Leader propus")
             .setRequired(true)
         )
     ),
@@ -2481,141 +3205,169 @@ ${teamStatus}
       }
 
       /* =====================================================
-         TEAM CREATE
+         TEAM MANAGEMENT
       ===================================================== */
 
-      if (
-        interaction.commandName ===
-          "team" &&
-        interaction.options.getSubcommand() ===
-          "create"
-      ) {
+      if (interaction.commandName === "team") {
+        if (!isGuildOwnerOrAdmin(interaction)) {
+          await interaction.reply({
+            content:
+              "❌ Doar ownerul serverului sau un administrator poate gestiona echipele.",
+            ephemeral: true,
+          });
+          return;
+        }
+
+        const subcommand = interaction.options.getSubcommand();
         const leader = interaction.options.getUser("leader");
-        const member1 =
-          interaction.options.getUser(
-            "member1"
-          );
 
-        const member2 =
-          interaction.options.getUser(
-            "member2"
-          );
-
-        const member3 =
-          interaction.options.getUser(
-            "member3"
-          );
-
-        const member4 =
-          interaction.options.getUser(
-            "member4"
-          );
-
-        const member5 =
-          interaction.options.getUser(
-            "member5"
-          );
-
-        const members = [
-          leader,
-          member1,
-          member2,
-          member3,
-          member4,
-          member5,
-        ];
-
-        const memberIds =
-          members.map(
-            (member) => member.id
-          );
-
-        if (
-          new Set(memberIds).size !== 6
-        ) {
+        if (!leader) {
           await interaction.reply({
-            content:
-              "❌ Team Leader-ul și cei 5 membri trebuie să fie persoane diferite.",
+            content: "❌ Alege un Team Leader.",
             ephemeral: true,
           });
-
           return;
         }
 
-        const leaderId =
-          leader.id;
+        const leaderId = leader.id;
 
-        const result =
-          await createTeamInDatabase(
+        if (subcommand === "create" || subcommand === "add") {
+          const member = interaction.options.getUser("member");
+
+          if (!member) {
+            await interaction.reply({
+              content: "❌ Alege membrul pe care vrei să îl adaugi.",
+              ephemeral: true,
+            });
+            return;
+          }
+
+          await interaction.deferReply({ ephemeral: true });
+
+          const result = await addMemberToTeamDraft(
+            interaction.guild,
             leaderId,
-            memberIds.slice(1)
+            member.id
           );
 
-        if (!result.success) {
-          await interaction.reply({
-            content:
-              `❌ ${result.error}`,
-            ephemeral: true,
-          });
+          if (!result.success) {
+            await interaction.editReply(`❌ ${result.error}`);
+            return;
+          }
 
+          if (result.completed) {
+            const roleNotice = result.roleResult?.success
+              ? ""
+              : `\n⚠️ ${result.roleResult?.error}`;
+
+            await interaction.editReply(
+              `✅ Echipa este completă.\n${formatCompletedTeamStatus(
+                result.team
+              )}${roleNotice}`
+            );
+            return;
+          }
+
+          if (result.finalizing) {
+            await interaction.editReply(
+              "⏳ Echipa are deja 5 membri și se finalizează acum. Verifică statusul peste câteva secunde."
+            );
+            return;
+          }
+
+          const action = result.added
+            ? `✅ <@${member.id}> a fost adăugat.`
+            : `ℹ️ <@${member.id}> era deja adăugat.`;
+
+          await interaction.editReply(
+            `${action}\n${formatTeamDraftProgress(result.draft)}`
+          );
           return;
         }
 
-        const guild =
-          interaction.guild;
+        if (subcommand === "remove") {
+          const member = interaction.options.getUser("member");
 
-        const leaderMember =
-          await guild.members.fetch(
-            leaderId
+          if (!member) {
+            await interaction.reply({
+              content: "❌ Alege membrul pe care vrei să îl scoți.",
+              ephemeral: true,
+            });
+            return;
+          }
+
+          await interaction.deferReply({ ephemeral: true });
+
+          const result = await removeMemberFromTeamDraft(
+            leaderId,
+            member.id
           );
 
-        const teamLeaderRole =
-          guild.roles.cache.find(
-            (role) =>
-              role.name ===
-              "Team Leader"
-          );
+          if (!result.success) {
+            await interaction.editReply(`❌ ${result.error}`);
+            return;
+          }
 
-        if (teamLeaderRole) {
-          await leaderMember.roles.add(
-            teamLeaderRole
+          await interaction.editReply(
+            `✅ <@${member.id}> a fost scos.\n${formatTeamDraftProgress(
+              result.draft
+            )}`
           );
+          return;
         }
 
-        await interaction.reply({
-          content: `
-✅ **ECHIPĂ CREATĂ**
+        if (subcommand === "cancel") {
+          await interaction.deferReply({ ephemeral: true });
 
-👑 Team Leader:
-<@${leaderId}>
+          const result = await cancelTeamDraft(leaderId);
 
-👥 Membri:
-<@${memberIds[1]}>
-<@${memberIds[2]}>
-<@${memberIds[3]}>
-<@${memberIds[4]}>
-<@${memberIds[5]}>
+          await interaction.editReply(
+            result.success
+              ? "✅ Echipa în construcție a fost anulată. Echipele complete existente nu sunt afectate."
+              : `❌ ${result.error}`
+          );
+          return;
+        }
 
-📋 Team ID:
-**${result.team.id}**
+        if (subcommand === "status") {
+          await interaction.deferReply({ ephemeral: true });
 
-🎁 Bonus Team Leader:
-**20 zile**
+          const completedResult = await getCompletedTeamByLeader(leaderId);
+          const draftResult = await getTeamDraft(leaderId);
 
-📅 Bonus început:
-${new Date(
-  result.team.bonus_start
-).toLocaleString("ro-RO")}
+          if (!completedResult.success || !draftResult.success) {
+            await interaction.editReply(
+              "❌ Nu am putut verifica echipa acum. Încearcă din nou."
+            );
+            return;
+          }
 
-📅 Bonus terminat:
-${new Date(
-  result.team.bonus_end
-).toLocaleString("ro-RO")}
-`,
-          ephemeral: false,
-        });
+          if (completedResult.team && draftResult.draft) {
+            await interaction.editReply(
+              "⚠️ Există atât o echipă completă, cât și una în construcție pentru acest Team Leader. Verifică datele cu un administrator."
+            );
+            return;
+          }
 
-        return;
+          if (completedResult.team) {
+            await interaction.editReply(
+              formatCompletedTeamStatus(completedResult.team)
+            );
+            return;
+          }
+
+          if (draftResult.draft) {
+            await interaction.editReply(
+              formatTeamDraftProgress(draftResult.draft)
+            );
+            return;
+          }
+
+          await interaction.editReply(
+            "ℹ️ Acest Team Leader nu are încă o echipă în construcție sau una completă."
+          );
+          return;
+        }
       }
 
       /* =====================================================
