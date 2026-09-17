@@ -9,7 +9,8 @@ Discord bot for NACE onboarding, screenshot verification, signals, bonuses and t
 - `Trader` role assignment after approval.
 - Normal signals at 12:10, 17:10 and 20:10 Europe/Bucharest, with same-minute duplicate protection.
 - New-member bonus for three days, activated only after the member confirms in DM that they are connected to the professor's signals; Team Leader bonus for 20 days.
-- `/status`, `/team create`, and administrator-only `/admin member`, `/admin team`, `/admin members`, `/admin teams`.
+- `/status`; owner/admin-only `/team create`, `/team add`, `/team remove`, `/team cancel`, `/team status`; and administrator-only `/admin member`, `/admin team`, `/admin members`, `/admin teams`.
+- Manual teams can be built one member at a time. The `Team Leader` role and its 20-day bonus start only after the fifth member is added.
 - Invite tracking: five unique, unassigned referrals plus the inviter form an automatic six-person team. The inviter becomes `Team Leader`.
 
 ## Configuration
@@ -17,6 +18,8 @@ Discord bot for NACE onboarding, screenshot verification, signals, bonuses and t
 Copy `.env.example` to `.env` for local development, then configure the same variables in Railway. Do not commit `.env`.
 
 Required: `DISCORD_TOKEN`, `GUILD_ID`, `TRADER_ROLE_ID`, `SUPABASE_URL`, `SUPABASE_KEY`.
+
+`SUPABASE_KEY` must be the server-side Supabase service-role key when Row Level Security is enabled. Keep it only in Railway or a local `.env`; never share it in Discord or commit it to Git.
 
 Optional: `OPENAI_API_KEY`, `OPENAI_MODEL`, `SIGNAL_CHANNEL_ID`, `NACE_URL`.
 
@@ -28,7 +31,7 @@ Enable the **Server Members Intent** and **Message Content Intent** in the Disco
 
 ## Supabase
 
-Run [`supabase/schema.sql`](supabase/schema.sql) before enabling automatic invite tracking. Existing `members`, `teams`, and `signal_logs` tables must remain available.
+Run [`supabase/schema.sql`](supabase/schema.sql) before enabling automatic invite tracking or manual team drafts. Existing `members`, `teams`, and `signal_logs` tables must remain available.
 
 ## Start locally / Railway
 
