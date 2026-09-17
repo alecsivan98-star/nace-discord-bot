@@ -127,6 +127,13 @@ function isGuildOwnerOrAdmin(interaction) {
   );
 }
 
+function canManageTeamForLeader(interaction, leaderId) {
+  return Boolean(
+    interaction.guild &&
+      (isGuildOwnerOrAdmin(interaction) || interaction.user.id === leaderId)
+  );
+}
+
 function truncate(text, max = 1900) {
   if (!text) return "";
   if (text.length <= max) return text;
@@ -1078,8 +1085,8 @@ async function createAutomaticTeamIfEligible(guild, leaderId) {
     return;
   }
 
-  // A draft means an owner/admin is choosing the members manually. Do not
-  // create a second automatic team for the same leader in the meantime.
+  // A draft means a Team Leader (or an admin) is choosing members manually.
+  // Do not create a second automatic team for the same leader in the meantime.
   if (draftResult.draft) {
     console.log(
       `ℹ️ Automatic team creation skipped for ${leaderId}: manual draft exists.`
@@ -2353,7 +2360,7 @@ Vezi statusul tău.
 
 \`/team create\`
 
-Ownerul sau un administrator poate începe o echipă cu un singur membru.
+Orice Team Leader își poate începe propria echipă cu un singur membru. Ownerul și administratorii pot gestiona orice echipă.
 
 \`/team add\`
 
@@ -3209,15 +3216,6 @@ ${teamStatus}
       ===================================================== */
 
       if (interaction.commandName === "team") {
-        if (!isGuildOwnerOrAdmin(interaction)) {
-          await interaction.reply({
-            content:
-              "❌ Doar ownerul serverului sau un administrator poate gestiona echipele.",
-            ephemeral: true,
-          });
-          return;
-        }
-
         const subcommand = interaction.options.getSubcommand();
         const leader = interaction.options.getUser("leader");
 
@@ -3230,6 +3228,15 @@ ${teamStatus}
         }
 
         const leaderId = leader.id;
+
+        if (!canManageTeamForLeader(interaction, leaderId)) {
+          await interaction.reply({
+            content:
+              "❌ Poți gestiona doar echipa în care tu ești Team Leader. Pentru echipa altcuiva, contactează un administrator.",
+            ephemeral: true,
+          });
+          return;
+        }
 
         if (subcommand === "create" || subcommand === "add") {
           const member = interaction.options.getUser("member");
