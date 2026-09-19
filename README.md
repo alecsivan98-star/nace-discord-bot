@@ -11,6 +11,8 @@ Discord bot for NACE onboarding, screenshot verification, signals, bonuses and t
 - New-member bonus for three days, activated only after the member confirms in DM that they are connected to the professor's signals; Team Leader bonus for 20 days.
 - `/status`; owner/admin-only `/team create`, `/team add`, `/team remove`, `/team cancel`, `/team status`; and administrator-only `/admin member`, `/admin team`, `/admin members`, `/admin teams`.
 - Manual teams can be built one member at a time. The `Team Leader` role and its 20-day bonus start only after the fifth member is added.
+- A private text channel is created from the first member, visible to the leader, team members, bot and server administrators. Membership is synchronized by `/team` commands; `/team status` retries failed channel provisioning. Existing teams and drafts receive channels on startup. Cancelling a draft preserves its channel history with access restricted to administrators and the bot.
+- Team channels require **Manage Channels** and **Manage Roles** for the bot. The `NACE_TEAM:<leader ID>` channel topic identifies managed channels across restarts; do not edit it manually.
 - Invite tracking: five unique, unassigned referrals plus the inviter form an automatic six-person team. The inviter becomes `Team Leader`.
 
 ## Configuration

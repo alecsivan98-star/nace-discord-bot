@@ -16,6 +16,7 @@ const {
 
 const OpenAI = require("openai");
 const { createClient } = require("@supabase/supabase-js");
+const { createTeamChannelManager } = require("./src/team-channels");
 
 /* =========================================================
    CONFIG
@@ -342,6 +343,34 @@ function getTeamMemberIds(team) {
   return TEAM_MEMBER_COLUMNS.map(
     (column) => team?.[column]
   ).filter(Boolean);
+}
+
+const syncTeamChannel = createTeamChannelManager(async (leaderId) => {
+  const completed = await getCompletedTeamByLeader(leaderId);
+  const draft = await getTeamDraft(leaderId);
+  if (!completed.success || !draft.success) throw new Error("Cannot read team roster");
+  if (completed.team && draft.draft) throw new Error("Conflicting team and draft");
+  return completed.team || draft.draft;
+});
+
+async function teamChannelNotice(guild, leaderId) {
+  const result = await syncTeamChannel(guild, leaderId);
+  if (!result.success) return `\n⚠️ ${result.error}`;
+  return result.channel ? `\n💬 Canal privat: <#${result.channel.id}>` : "";
+}
+
+async function restoreTeamChannels(guild) {
+  const leaders = new Set();
+  for (const table of ["teams", "team_drafts"]) {
+    for (let offset = 0; ; offset += 500) {
+      const { data, error } = await supabase.from(table)
+        .select("leader_discord_id").order("leader_discord_id").range(offset, offset + 499);
+      if (error) throw error;
+      for (const row of data) leaders.add(row.leader_discord_id);
+      if (data.length < 500) break;
+    }
+  }
+  for (const leaderId of leaders) await syncTeamChannel(guild, leaderId);
 }
 
 function formatTeamDraftProgress(draft) {
@@ -1152,6 +1181,7 @@ async function createAutomaticTeamIfEligible(guild, leaderId) {
       roleResult.error
     );
   }
+  await syncTeamChannel(guild, leaderId);
 }
 
 async function recordReferralAndCheckTeam(member, invite) {
@@ -2575,6 +2605,9 @@ client.once("clientReady", async () => {
     "🤖 NACE Assistant is online."
   );
 
+  client.guilds.fetch(GUILD_ID).then(restoreTeamChannels)
+    .catch(error => console.error("Initial team channels:", error));
+
   checkSignals();
 
   setInterval(
@@ -3270,7 +3303,7 @@ ${teamStatus}
             await interaction.editReply(
               `✅ Echipa este completă.\n${formatCompletedTeamStatus(
                 result.team
-              )}${roleNotice}`
+              )}${roleNotice}${await teamChannelNotice(interaction.guild, leaderId)}`
             );
             return;
           }
@@ -3287,7 +3320,7 @@ ${teamStatus}
             : `ℹ️ <@${member.id}> era deja adăugat.`;
 
           await interaction.editReply(
-            `${action}\n${formatTeamDraftProgress(result.draft)}`
+            `${action}\n${formatTeamDraftProgress(result.draft)}${await teamChannelNotice(interaction.guild, leaderId)}`
           );
           return;
         }
@@ -3318,7 +3351,7 @@ ${teamStatus}
           await interaction.editReply(
             `✅ <@${member.id}> a fost scos.\n${formatTeamDraftProgress(
               result.draft
-            )}`
+            )}${await teamChannelNotice(interaction.guild, leaderId)}`
           );
           return;
         }
@@ -3330,7 +3363,7 @@ ${teamStatus}
 
           await interaction.editReply(
             result.success
-              ? "✅ Echipa în construcție a fost anulată. Echipele complete existente nu sunt afectate."
+              ? `✅ Echipa în construcție a fost anulată. Echipele complete existente nu sunt afectate. Istoricul canalului nu este șters.${await teamChannelNotice(interaction.guild, leaderId)}`
               : `❌ ${result.error}`
           );
           return;
@@ -3358,20 +3391,20 @@ ${teamStatus}
 
           if (completedResult.team) {
             await interaction.editReply(
-              formatCompletedTeamStatus(completedResult.team)
+              formatCompletedTeamStatus(completedResult.team) + await teamChannelNotice(interaction.guild, leaderId)
             );
             return;
           }
 
           if (draftResult.draft) {
             await interaction.editReply(
-              formatTeamDraftProgress(draftResult.draft)
+              formatTeamDraftProgress(draftResult.draft) + await teamChannelNotice(interaction.guild, leaderId)
             );
             return;
           }
 
           await interaction.editReply(
-            "ℹ️ Acest Team Leader nu are încă o echipă în construcție sau una completă."
+            `ℹ️ Acest Team Leader nu are încă o echipă în construcție sau una completă.${await teamChannelNotice(interaction.guild, leaderId)}`
           );
           return;
         }
